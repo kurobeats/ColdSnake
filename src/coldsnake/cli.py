@@ -24,8 +24,11 @@ LEGACY_CREDS = os.path.expanduser("~/.config/icedrive/credentials")
 def load_config(path: str) -> dict:
     if not path or not os.path.exists(path):
         return {}
-    with open(path, "rb") as handle:
-        return tomllib.load(handle)
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        raise PreflightError(f"bad config {path}: {exc}") from exc
 
 
 def resolve_device_id(config: dict) -> str:
@@ -64,7 +67,7 @@ def resolve_credentials(config: dict) -> tuple[str, str]:
                 elif line.startswith("ICEDRIVE_PASSWORD="):
                     password = password or line.split("=", 1)[1]
     if not email or not password:
-        sys.exit(
+        raise PreflightError(
             "no credentials: set ICEDRIVE_EMAIL / ICEDRIVE_PASSWORD, add an [auth] "
             f"section to {DEFAULT_CONFIG}, or create {LEGACY_CREDS} (0600)")
     return email, password
@@ -87,11 +90,12 @@ def resolve_pairs(args, config: dict) -> list[tuple[str, str]]:
     """Pairs from --local/--remote, else from the config's [[mirror]] entries."""
     if getattr(args, "local", None):
         if not args.remote:
-            sys.exit("--local requires --remote")
+            raise PreflightError("--local requires --remote")
         return [(args.local, args.remote)]
     pairs = parse_pairs(config)
     if not pairs:
-        sys.exit(f"no mirrors: pass --local/--remote or add [[mirror]] entries to {args.config}")
+        raise PreflightError(
+            f"no mirrors: pass --local/--remote or add [[mirror]] entries to {args.config}")
     return pairs
 
 
@@ -101,16 +105,19 @@ def parse_pairs(config: dict) -> list[tuple[str, str]]:
     for entry in config.get("mirror", []):
         local, remote = entry.get("local"), entry.get("remote")
         if not local or not remote:
-            sys.exit("each [[mirror]] entry needs 'local' and 'remote'")
+            raise PreflightError("each [[mirror]] entry needs 'local' and 'remote'")
         pairs.append((local, remote))
     return pairs
 
 
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--verbose", action="store_true", help="log per-file decisions")
-    common.add_argument("--config", default=DEFAULT_CONFIG, help=f"config file (default {DEFAULT_CONFIG})")
-
+    common.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS,
+                        help="log per-file decisions")
+    common.add_argument("--config", default=argparse.SUPPRESS,
+                        help=f"config file (default {DEFAULT_CONFIG})")
+    common.add_argument("--no-token-cache", action="store_true", default=argparse.SUPPRESS,
+                        help="always log in (ignore the cached token)")
     parser = argparse.ArgumentParser(prog="coldsnake", description="Icedrive client (no WebDAV)", parents=[common])
     parser.add_argument("--version", action="version", version=f"coldsnake {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -131,12 +138,29 @@ def main(argv: list[str] | None = None) -> int:
     mirror.add_argument("--dry-run", action="store_true", help="report what would upload, change nothing")
     mirror.add_argument("--allow-empty", action="store_true",
                         help="do not refuse when a source directory is empty")
-    parser.add_argument("--no-token-cache", action="store_true", help="always log in (ignore the cached token)")
+    mirror.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                        help="skip files/dirs matching GLOB (repeatable)")
+    mirror.add_argument("--prune", action="store_true",
+                        help="delete remote files that no longer exist locally")
+    mirror.add_argument("--prune-force", action="store_true",
+                        help="allow prune to exceed the sanity threshold")
+
+    dl = sub.add_parser("download", parents=[common], help="download from Icedrive to a local directory")
+    dl.add_argument("--remote", required=True, help="remote folder name (as in [[mirror]] remote)")
+    dl.add_argument("--local", required=True, help="destination directory")
+    dl.add_argument("--file", action="append", default=[], metavar="RELPATH",
+                    help="relative path under the mirror root (repeatable; default: whole tree)")
 
     args = parser.parse_args(argv)
-    config = load_config(args.config)
+    # argparse subparsers overwrite main-parser values with their own defaults,
+    # so the shared flags parse with SUPPRESS and are filled in here - this is
+    # what makes them work before or after the sub-command.
+    args.verbose = getattr(args, "verbose", False)
+    args.config = getattr(args, "config", DEFAULT_CONFIG)
+    args.no_token_cache = getattr(args, "no_token_cache", False)
 
     try:
+        config = load_config(args.config)
         if args.command == "login":
             client = build_client(args, config)
             log("login ok")
@@ -176,9 +200,52 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{kind}{size}  {entry['filename']}")
             return 0
 
+        if args.command == "download":
+            if not args.remote:
+                raise PreflightError("download needs --remote (the mirror root folder name)")
+            if not args.file and not os.path.isdir(os.path.expanduser(args.local)):
+                raise PreflightError(f"destination does not exist: {args.local}")
+            client = build_client(args, config)
+            root = next((e["id"] for e in client.listing(0)
+                         if e.get("filename") == args.remote and e.get("isFolder")), None)
+            if root is None:
+                raise PreflightError(f"remote folder {args.remote!r} not found at the drive root")
+            dest_root = os.path.expanduser(args.local)
+            wanted = set(args.file)
+            failures = 0
+
+            # flat, explicit walk: download every file under the mirror root
+            stack = [(root, "")]
+            found: set[str] = set()
+            while stack:
+                folder_id, rel = stack.pop()
+                for entry in client.listing(folder_id):
+                    name, child_rel = entry["filename"], (os.path.join(rel, entry["filename"]) if rel else entry["filename"])
+                    if entry.get("isFolder"):
+                        stack.append((entry["id"], child_rel))
+                        if not wanted:
+                            os.makedirs(os.path.join(dest_root, child_rel), exist_ok=True)
+                        continue
+                    if wanted and child_rel not in wanted:
+                        continue
+                    found.add(child_rel)
+                    try:
+                        size = client.download(entry["id"], os.path.join(dest_root, child_rel))
+                        log(f"downloaded {child_rel} ({size} bytes)")
+                    except Exception as exc:                    # noqa: BLE001 - isolate per file
+                        failures += 1
+                        log(f"FAILED {child_rel}: {str(exc)[:200]}")
+            if wanted:
+                for missing in sorted(wanted - found):
+                    failures += 1
+                    log(f"FAILED {missing}: not found under {args.remote}")
+            log(f"done: {len(found)} downloaded, {failures} failure(s)")
+            return 1 if failures else 0
+
         # mirror
         pairs = resolve_pairs(args, config)
         client = build_client(args, config)
+        excludes = list(args.exclude) + list(config.get("exclude", []))
 
         # Nothing long runs until the service answers and the sources are sane.
         info = preflight(client, pairs, allow_empty=args.allow_empty)
@@ -198,7 +265,8 @@ def main(argv: list[str] | None = None) -> int:
         failures = 0
         for local, remote in pairs:
             mirrorer = Mirror(client, local, remote, dry_run=args.dry_run, verbose=args.verbose,
-                              log=log, quota_check=quota_check)
+                              log=log, quota_check=quota_check, excludes=excludes,
+                              prune=args.prune, prune_force=args.prune_force)
             try:
                 stats = mirrorer.run()
             except Exception as exc:                            # noqa: BLE001 - one dir must not stop the rest

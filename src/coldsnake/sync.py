@@ -10,6 +10,7 @@ Safety properties, deliberately:
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 from dataclasses import dataclass, field
 
@@ -71,7 +72,9 @@ class Mirror:
     """Mirror one local directory tree into one remote folder."""
 
     def __init__(self, client: Client, root: str, remote: str,
-                 dry_run: bool = False, verbose: bool = False, log=print, quota_check=None):
+                 dry_run: bool = False, verbose: bool = False, log=print, quota_check=None,
+                 excludes: list[str] | None = None, prune: bool = False,
+                 prune_force: bool = False):
         self.client = client
         self.root = root
         self.remote = remote
@@ -79,10 +82,20 @@ class Mirror:
         self.verbose = verbose
         self.log = log
         self.quota_check = quota_check      # callable(needed_bytes) -> None, may raise
+        self.excludes = excludes or []
+        self.prune = prune
+        self.prune_force = prune_force
         self.stats = Stats()
         self._folder_ids: dict[str, int] = {}
         self._listings: dict[str, list[dict]] = {}
         self._uploaded: dict[str, list[tuple[str, int]]] = {}
+        self._local_files: set[str] = set()
+        self._walked_dirs: list[str] = []
+
+    def excluded(self, rel: str) -> bool:
+        """True when a relative path matches any exclusion glob (rel or basename)."""
+        base = os.path.basename(rel)
+        return any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(base, pat) for pat in self.excludes)
 
     # --- remote tree -----------------------------------------------------
     def entries(self, rel: str) -> list[dict]:
@@ -133,11 +146,16 @@ class Mirror:
             raise NotADirectoryError(f"{self.root} is not a directory")
         dirs: list[str] = []
         files: list[str] = []
-        for dirpath, _dirnames, filenames in os.walk(self.root):
+        for dirpath, dirnames, filenames in os.walk(self.root):
             rel_dir = os.path.relpath(dirpath, self.root)
             rel_dir = "" if rel_dir == "." else rel_dir
+            # do not even descend into excluded directories
+            dirnames[:] = [d for d in dirnames if not self.excluded(os.path.join(rel_dir, d) if rel_dir else d)]
             dirs.append(rel_dir)
-            files.extend(os.path.join(rel_dir, name) if rel_dir else name for name in filenames)
+            kept = [name for name in filenames if not self.excluded(os.path.join(rel_dir, name) if rel_dir else name)]
+            files.extend(os.path.join(rel_dir, name) if rel_dir else name for name in kept)
+        self._walked_dirs = dirs
+        self._local_files = set(files)
         self.log(f"[{self.remote}] {len(dirs)} dirs / {len(files)} files under {self.root}")
 
         for rel_dir in sorted(dirs, key=lambda d: (d.count(os.sep), d)):
@@ -189,7 +207,47 @@ class Mirror:
 
         if not self.dry_run and self._uploaded:
             self.verify()
+        if self.prune and not self.dry_run:
+            self.prune_remote()
         return self.stats
+
+    def prune_remote(self) -> None:
+        """Delete remote files that no longer exist locally.
+
+        Guards (see README): a complete fresh remote listing is taken first,
+        only files are deleted (the API cannot delete folders), everything stays
+        inside this mirror's own subtree, and a large wipe must be forced.
+        """
+        deletions: list[tuple[int, int, str]] = []
+        remote_total = 0
+        for rel_dir in sorted(self._walked_dirs):
+            folder_id = self._folder_ids.get(rel_dir)
+            if folder_id is None or folder_id < 0:      # never created, nothing to prune
+                continue
+            for entry in self.client.listing(folder_id):
+                if entry.get("isFolder"):
+                    continue
+                remote_total += 1
+                name = entry["filename"]
+                rel = os.path.join(rel_dir, name) if rel_dir else name
+                if rel not in self._local_files and not self.excluded(rel):
+                    deletions.append((folder_id, entry["id"], rel))
+        if not deletions:
+            self.log(f"[{self.remote}] prune: nothing to delete")
+            return
+        threshold = max(50, remote_total // 4)
+        if len(deletions) > threshold and not self.prune_force:
+            raise PreflightError(
+                f"prune would delete {len(deletions)} file(s) in {self.remote} "
+                f"(threshold {threshold}); pass --prune-force if this is intended")
+        for folder_id, file_id, rel in deletions:
+            try:
+                self.client.delete_file(file_id)
+                self.log(f"  pruned {rel}")
+            except Exception as exc:                        # noqa: BLE001 - isolate per file
+                self.stats.failures.append((rel, str(exc)[:200]))
+                self.log(f"  FAILED prune {rel}: {str(exc)[:200]}")
+        self.log(f"[{self.remote}] pruned {len(deletions)} stale file(s)")
 
     def verify(self) -> None:
         """Re-list every folder written to and check the sizes we uploaded."""
