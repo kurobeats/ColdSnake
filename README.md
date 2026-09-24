@@ -1,48 +1,61 @@
 # ColdSnake
+
 A python icedrive client.
 
 Upload-only mirroring, folder listing and proof-of-work login for Icedrive, driven
-directly against the v3 mobile API that Icedrive's own apps use.
+directly against the v3 mobile API that Icedrive's own apps use. No WebDAV, no GUI,
+no third-party binaries, no dependencies beyond the standard library.
+
+Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
+Verified against a live Icedrive account (login, listing, chunked uploads,
+verification, idempotent re-runs). 21 unit tests.
 
 ## Why this exists
 
-Icedrive's WebDAV service was disabled for new users on 2026-04-15 and is being
-gradually sunset for existing users, and Icedrive has no public API (the feature
-request to rclone has been open since 2019). The official Linux client is a
-Qt/WebEngine GUI app that mounts over FUSE, which is not something you can run
-unattended on a server. ColdSnake talks to the same endpoints the official apps
-use, from the command line, with no GUI, no WebDAV and no third-party binaries.
+- Icedrive **disabled WebDAV for new users on 2026-04-15** and is gradually
+  sunsetting it for existing users.
+- Icedrive has **no public API** - the rclone feature request has been open since
+  2019 and Icedrive's own answers are "planned, eventually".
+- Their Linux client is a Qt/WebEngine **GUI** app that mounts over FUSE. It cannot
+  be run unattended on a headless server, and a user asking for a Linux CLI in
+  Icedrive's own forum got no answer.
 
-## What it does
-
-* **login** - proof-of-work challenge, no captcha service needed
-* **ls** - list a remote folder
-* **mirror** - upload-only mirror of local directory trees into Icedrive
-
-## What it deliberately will not do
-
-* **Never deletes or truncates anything remote.** No deletes at all. A bad run
-  can waste bandwidth, not data.
-* No encrypted-folder support (Icedrive's crypto is not implemented).
+ColdSnake talks to the same endpoints those apps use, from the command line, so a
+headless host can back itself up on a schedule.
 
 ## Install
 
 ```bash
-pip install .          # or: pipx install .
+pip install .            # or: pipx install .
 coldsnake --version
 ```
 
-Python 3.11+ (uses `tomllib`), standard library only, no dependencies.
+Python **3.11+** (uses `tomllib`), standard library only.
+
+Running from a checkout without installing:
+
+```bash
+PYTHONPATH=src python3 -m coldsnake.cli --help
+```
 
 ## Credentials
 
 Resolved in this order:
 
 1. `ICEDRIVE_EMAIL` / `ICEDRIVE_PASSWORD` environment variables
-2. `[auth]` section in the config file
-3. `~/.config/icedrive/credentials` (lines `ICEDRIVE_EMAIL=...`, `ICEDRIVE_PASSWORD=...`)
+2. `[auth]` in the config file
+3. `~/.config/icedrive/credentials` - lines `ICEDRIVE_EMAIL=…`, `ICEDRIVE_PASSWORD=…`
 
-Keep any file holding the password at mode `0600`. **Never commit credentials** - the repo's `.gitignore` blocks `config.toml`, `credentials`, `.env`, `*.creds` and `*.key` for that reason; copy `config.example.toml` and fill it in outside the repo (e.g. `~/.config/coldsnake/config.toml`).
+Whichever you use, keep the file at mode `0600`. **Never commit credentials** - the
+repo's `.gitignore` blocks `config.toml`, `credentials`, `.env`, `*.creds` and
+`*.key` for that reason. Copy `config.example.toml` and fill it in *outside* the repo.
+
+Two more files live under `~/.config/coldsnake/` and are safe to delete:
+
+| file | purpose |
+|---|---|
+| `token` (0600) | cached bearer token + account info, so runs rarely need to log in |
+| `device-id` | stable client id, sent as `X-Icedrive-Device-Id` |
 
 ## Configure mirrors
 
@@ -62,18 +75,28 @@ local = "/srv/data/Pictures"
 remote = "Pictures"
 ```
 
+`remote` is a folder name created at the **root of your Icedrive** if it does not
+exist; the local tree is mirrored inside it.
+
 ## Usage
 
 ```bash
-coldsnake login                              # verify credentials, print the account
-coldsnake ls                                 # list the remote root
-coldsnake ls --folder-id 12345               # list a specific folder
-coldsnake mirror --dry-run                   # report what would upload
-coldsnake mirror                             # every [[mirror]] in the config
+coldsnake login                       # verify credentials, print the account
+coldsnake account                     # plan, storage quota, bandwidth usage
+coldsnake check                       # pre-flight only: service + sources. no uploads
+coldsnake ls                          # list the remote root
+coldsnake ls --folder-id 12345        # list one remote folder
+coldsnake mirror --dry-run            # report what would upload, change nothing
+coldsnake mirror                      # every [[mirror]] in the config
 coldsnake mirror --local /srv/data/music --remote music
+coldsnake mirror --allow-empty        # tolerate an empty source directory
 ```
 
-Exit codes, so this drops straight into cron, systemd or a CI job:
+Global flags: `--verbose` (per-file decisions), `--config PATH`,
+`--no-token-cache` (always log in), `--version`. They work before or after the
+sub-command.
+
+### Exit codes
 
 | code | meaning |
 |---|---|
@@ -82,51 +105,68 @@ Exit codes, so this drops straight into cron, systemd or a CI job:
 | 2 | refused to start: bad config, missing/unreadable/empty source, auth failure |
 | 3 | service unavailable - nothing was attempted, retry later |
 
+That makes it safe to drop into cron, systemd, or a CI job.
+
 ### Pre-flight (runs before every mirror)
 
-A long run is not started until the cheap checks pass:
+A long run is never started on a whim:
 
 1. **Service health** - one authenticated call. If Icedrive is up but degraded
    (`Fatal error encountered`, `Service temporarily unavailable`), the run stops in
-   under a second with exit 3 rather than spending hours on failed uploads.
-2. **Sources** - missing, unreadable, or *empty* source directories are refused
-   (pass `--allow-empty` to override). An empty source means the mirror would do
-   nothing - or, once pruning exists, delete things.
+   under a second with exit 3 instead of spending hours on failed uploads.
+2. **Sources** - missing, unreadable or **empty** source directories are refused
+   (`--allow-empty` overrides). An empty source means the mirror would do nothing -
+   or, once pruning exists, delete things.
 3. **Config** - the same local path listed twice is refused.
-4. **Storage** - free space is checked against the bytes actually pending, once
-   the plan is known (see the quota caveat below).
+4. **Storage** - free space is checked against the bytes actually pending, once the
+   plan is known (see the quota caveat).
 
-`coldsnake check` runs the pre-flight alone - handy as a monitoring probe.
+`coldsnake check` runs the pre-flight alone, which makes it a useful monitoring
+probe.
 
 ## Behaviour worth knowing
 
-* **Incremental.** Uploads only when the size or mtime differs. Icedrive
-  preserves the mtime sent at upload time, so re-runs are cheap.
-* **Streams.** File bodies are streamed through a single multipart request with a
-  known `Content-Length`; process memory does not scale with file size.
-* **Re-uploads overwrite.** Uploading a name that already exists in a folder
-  replaces it server-side (same file id, no duplicate) - verified against the
-  live API - so syncing repeatedly never leaves duplicates.
-* **Verifies.** After uploading, each folder written to is re-listed and the
-  sizes checked. Mismatches are reported as failures.
-* **Retries.** 5xx/429/network errors retry with backoff; 401/403 triggers one
-  fresh login. The API sits behind Cloudflare and does return intermittent
-  `522`s, so this matters in practice.
-* **Per-file isolation.** One unreadable or rejected file does not stop the run;
-  it is logged and counted in the exit code.
+* **Incremental.** Uploads only when size or mtime differ (mtime tolerance 2 s).
+  Icedrive preserves the upload-time mtime, so a second run is nearly free: a
+  2 583-file tree re-checks in ~56 s and uploads nothing.
+* **Additive.** No deletes are ever issued. A file removed locally stays remote.
+  (Pruning is designed but not implemented - see Roadmap.)
+* **Chunked and resumable.** Files larger than `chunk_size` (8 MiB by default) are
+  uploaded as ranged chunks: a stall costs one chunk, not a 4 GB file.
+* **Streams.** File bodies are streamed through one request with a known
+  `Content-Length`; process memory does not scale with file size.
+* **Verifies.** After uploading, each folder written to is re-listed and file sizes
+  are compared. Mismatches are reported as failures, not swallowed.
+* **Retries.** Transport errors (5xx/429/522, timeouts) retry with backoff; an
+  auth error triggers one fresh login; API-reported outages retry slowly (30 s ×
+  attempt) rather than hammering.
+* **Per-file isolation.** One bad file does not stop the run; it is logged, counted,
+  and reflected in the exit code.
+* **Re-uploads overwrite.** Uploading a name that already exists replaces it
+  server-side (same file id, no duplicate), so repeated syncs never create
+  duplicates.
 
-### Throughput
+### Throughput (measured against a live account)
 
-Icedrive ingress appears capped at roughly **1.5-2 MB/s per account**: three
-concurrent 20 MB uploads finished no faster than one, so ColdSnake uploads
-sequentially on purpose. A 150 GB first pass therefore takes on the order of a
-day, split across runs - it resumes where it left off.
+Icedrive ingress is capped at roughly **1.5-2 MB/s per account**: three concurrent
+20 MB uploads finished no faster than one, so ColdSnake uploads sequentially on
+purpose. Small-file rates are bound by round trips, so connections are kept alive.
+
+| workload | measured |
+|---|---|
+| 2 583 files / 283 MB | ~10 min uploading, then 56 s for a no-op re-check |
+| 107.6 MB single file (13 chunks) | 69 s → 1.56 MB/s |
+| 26 MB / 4 chunks, 134 MB / 16 chunks | correct sizes, no chunk overhead |
+| 147 GB across 4 trees | ~25 h first pass, dominated by a 106 GB music tree |
+
+The first pass is long but **incremental and resumable**: a killed or failed run
+continues where it left off, so nightly runs simply chip away at it. Steady-state
+nightly runs are minutes.
 
 ## systemd
 
-`systemd/` ships a `coldsnake.service` + `coldsnake.timer` pair (nightly 05:00)
-and a `coldsnake@.service` template for running as another user. Install as user
-units for the simplest setup:
+`systemd/` ships a `coldsnake.service` + `coldsnake.timer` pair (nightly 05:00) and a
+`coldsnake@.service` template for running as another user.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -134,74 +174,143 @@ cp systemd/coldsnake.service systemd/coldsnake.timer ~/.config/systemd/user/
 systemctl --user enable --now coldsnake.timer
 ```
 
-Set `TimeoutStartSec=infinity` stays as shipped: a first full pass can run for
-hours, and systemd will not start a second copy while one is still running.
+For a system-wide install with credentials in an env file:
+
+```ini
+[Service]
+User=backup
+EnvironmentFile=-/home/backup/.config/coldsnake/credentials
+ExecStart=/usr/local/bin/coldsnake mirror
+```
+
+`TimeoutStartSec=infinity` (as shipped) matters: a first full pass runs for hours,
+and systemd will not start a second copy while one is running.
 
 ## Protocol notes
 
-Recovered from Icedrive's own clients (mobile API, `apis.icedrive.net/v3/mobile`):
+Recovered from Icedrive's own clients; the mobile API lives at
+`https://apis.icedrive.net/v3/mobile` with `User-Agent: icedrive-ios/2.3.1`.
 
 ```
 POST /api  {app:ios, request:pow-new, scope:login}      -> proof-of-work challenge
 POST /api  {password, email, pow_proof, request:login}  -> bearer token
+GET  /user-stats                                        -> storage + bandwidth usage
 GET  /collection?type=cloud&folderId=<id>               -> folder listing
 POST /folder-create (multipart)                         -> create a folder
 GET  /geo-fileserver-list?app=ios&pow_proof=<b64>       -> signed /deposit endpoints
-POST <deposit endpoint> multipart {folderId, moddate, files[]} -> store the file
+POST <deposit endpoint> multipart {folderId, moddate, files[]}          -> whole file
+POST <deposit endpoint> multipart {folderId, moddate, unique_upload_id,
+                                   files[]} + Content-Range: bytes a-b/total -> chunk
 ```
 
-The proof-of-work is `sha256(challenge_bytes || nonce12 || counter_be32)` needing
-at least `difficultyBits` leading zero bits; `pow_proof` is the base64 of the
-challenge fields plus the winning nonce and hash.
+Details that matter:
 
-## Capability notes (reviewed against Icedrive's own client)
+* **Proof of work** - `sha256(challenge_bytes || nonce12 || counter_be32)` must have
+  at least `difficultyBits` leading zero bits; `pow_proof` is the base64 of the
+  challenge fields plus the winning nonce and hash.
+* **Errors arrive as HTTP 200** with `{"error": true, "code": …, "message": …}`.
+  Responses are validated; without that, a failed listing looks exactly like an empty
+  remote folder and everything gets re-uploaded.
+* **Chunk semantics** (verified live): ranges are keyed by `unique_upload_id`;
+  re-sending a range is idempotent (the file does not grow); a gap is accepted
+  silently; resuming with a *different* id is rejected (`Error handling upload
+  parts`). So the id is derived from destination + size + mtime and reused across
+  retries and runs, and the end-of-upload size check is mandatory.
+* **Client identity** - Icedrive's own clients send `X-App-Method: sync` and a stored
+  `X-Icedrive-Device-Id`; ColdSnake sends both.
 
-Icedrive's Linux client is a Qt/WebEngine GUI app; there is no headless build and
-no public API. Its binary was reviewed to work out what a scheduled sync needs:
+## Capability comparison
 
-| capability | source of truth | ColdSnake |
-|---|---|---|
-| proof-of-work login | `pow_proof`, challenge solve | yes |
-| bearer token reuse | app stores `icedrive_stored_cred` | yes - cached 0600, re-login on auth error |
-| device identity | `X-Icedrive-Device-Id`, `X-App-Method: sync` | yes |
-| folder create | `request=folder-create` | yes (creates the remote tree) |
-| listing | `/collection`, `request=collection-tree-full` | yes, recursive per folder |
-| upload | multipart to signed `/deposit` endpoints | yes, streamed with keep-alive |
-| **resumable/chunked upload** | `unique_upload_id` + `Content-Range: bytes a-b/total`, replies `"Chunk uploaded"` then `"Upload Successful"` | **yes** - files over `chunk_size` (default 8 MiB) |
-| storage quota | `GET /user-stats` (`storage.free`, `bandwidth`) | yes - pre-flight gate + `coldsnake account` |
-| error signalling | API returns HTTP 200 with `{"error": true, "code": ...}` | yes - payloads validated, auth codes re-login |
-| retries/backoff | app retries with "please try again later" | yes - 5xx/429/522 + socket-timeout retries |
-| 2FA | `request=gauthconfirm`, `smsconfirm`, `u2fstart` | **no** - see Limitations |
+Reviewed against Icedrive's GUI client to work out what a scheduled, headless sync
+actually needs.
 
-| download / restore | `/download-multi` | **no** - use the web UI |
-| encrypted folders | `crypto` flag, padding header | **no** - plain uploads only |
+| capability | ColdSnake |
+|---|---|
+| proof-of-work login | yes |
+| bearer token reuse | yes - cached 0600, re-login on auth error |
+| device identity | yes |
+| recursive listing, folder creation | yes |
+| streamed uploads, keep-alive | yes |
+| chunked / resumable uploads | yes - stable id, idempotent range retries |
+| post-upload verification | yes (sizes; hashes not available without download) |
+| storage quota check | yes - pre-flight gate + `coldsnake account` |
+| retries, backoff, per-file isolation | yes |
+| download / restore | **no** |
+| 2FA (TOTP / SMS / U2F) | **no** |
+| encrypted folders (IceCrypto) | **no** |
+| two-way sync, live folder watching | **no** |
+| move / rename / trash restore | **no** |
+| prune local deletions | **no** (additive only) |
+| exclusions / ignore patterns | **no** |
 
 ## Limitations
 
-* Unofficial API. Icedrive can change or block it at any time; treat failures as
-  loud rather than silent (the exit code and logs are there for that).
-* **2FA is not implemented.** With 2FA enabled on the account, `coldsnake login`
-  cannot complete. The cached token means this only bites when the token is
-  invalidated; otherwise disable 2FA for the account used by scheduled runs.
-* Chunked uploads retry a *range*, not a whole file, so a stall costs at most
-  `chunk_size` of traffic. Measured against the live API: re-sending a range is
-  idempotent (the file does not grow), while resuming a partial upload with a
-  different `unique_upload_id` is rejected - so the id is derived from
-  destination+size+mtime and reused across retries and runs. If a whole run dies
-  mid-file, that file is re-sent from the start (same id, idempotent ranges) and
-  the post-upload size check still guards correctness.
-* Folder deletion is not supported by this API (the call reports success and the
-  folder stays); delete folders from the web UI.
-* Download is not implemented yet.
-* Only the storage *quota* is enforced; bandwidth limits are reported by
-  `/user-stats` but not acted on.
+* **Unofficial API.** Icedrive can change or block it at any time. Failures are
+  loud (exit codes, logs) rather than silent, which is the best that can be done.
+* **2FA is not implemented.** With 2FA enabled, `coldsnake login` cannot complete.
+  The cached token means this only bites when the token is invalidated; otherwise
+  use an account without 2FA for scheduled runs.
+* **No download/restore.** `/download-multi` answers `5000: No files found` for
+  every addressing form tried, `/download` rejects the obvious parameters. Restores
+  currently mean the web UI or the desktop app. This is the weakest link for a
+  backup tool and is on the roadmap.
+* **Folders cannot be deleted** through this API: `/erase` reports success and the
+  folder stays. Files delete fine. Empty remote directories linger.
+* **Quota numbers are unreliable.** On the account tested, `/user-stats` reports
+  0 bytes used after 290 MB of uploads, so the storage gate is a safety net rather
+  than a meter.
+* **Cross-run resume restarts a file.** In-run retries resume a chunk; if the whole
+  run dies mid-file, that file is re-sent from the start (same id, idempotent
+  ranges, size still verified).
+* **Additive only.** Stale remote files must be removed by hand until pruning lands.
+* **No exclusions.** Everything under a source directory is mirrored, including
+  `.stversions`, `.stfolder` and cache directories.
+* Single account, single config, no profiles. Proxy support is untested (urllib
+  honours `http_proxy`/`https_proxy`).
 
-## Tests
+## Roadmap
+
+1. **Prune local deletions** - opt-in `--prune`, with guards: never prune when a
+   source is missing/empty, abort if deletions exceed a sanity threshold unless
+   forced, only inside the destination subtree, and only after a complete remote
+   listing. Files only; folders cannot be deleted.
+2. **Download/restore** - including ranged download for large files, which also
+   unlocks content-hash verification.
+3. **Exclusions** - `--exclude` globs, and an include/exclude config section.
+4. **Hash integrity** - the upload path accepts a `hashAlgorithm` field; sending and
+   comparing hashes would catch same-size corruption that the size check misses.
+5. Smaller items: confirm listing pagination on very large folders (~1 200 entries
+   per folder is currently proven fine), consider `request=collection-tree-full`
+   for cheaper full-tree listing, structured/JSON run summaries for monitoring,
+   PyPI packaging and CI.
+
+## Development
 
 ```bash
-python -m unittest discover -s tests
+python -m unittest discover -s tests     # 21 tests, no dependencies
 ```
+
+Layout:
+
+```
+src/coldsnake/client.py   API client: PoW login, listing, folders, chunked uploads
+src/coldsnake/sync.py     mirror logic, pre-flight checks, verification
+src/coldsnake/cli.py      argument parsing, config, credentials/token/device-id
+tests/test_coldsnake.py   proof-of-work, chunk planning, payload validation,
+                          pre-flight, mirror behaviour (against an in-memory client)
+```
+
+Tests must pass before a change lands. The mirror tests use an in-memory fake, so
+nothing touches the network; anything verified against the live API is noted in this
+file rather than encoded as a test.
+
+## Credits
+
+Protocol details were reconstructed from Icedrive's own desktop client (its
+embedded web UI and its strings) and cross-checked against
+[`StarHack/go-icedrive`](https://github.com/StarHack/go-icedrive), an independent Go
+client for the same mobile API. Neither is affiliated with this project.
 
 ## License
 
-GPL-3.0-or-later, see LICENSE.
+GPL-3.0-or-later. See [LICENSE](LICENSE).

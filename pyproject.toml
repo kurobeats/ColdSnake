@@ -22,7 +22,9 @@ dependencies = []
 coldsnake = "coldsnake.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/antcoz/ColdSnake"
+Homepage = "https://github.com/kurobeats/ColdSnake"
+Issues = "https://github.com/kurobeats/ColdSnake/issues"
+Source = "https://github.com/kurobeats/ColdSnake"
 
 [tool.setuptools.packages.find]
 where = ["src"]
