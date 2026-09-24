@@ -193,8 +193,9 @@ nightly runs are minutes.
 
 ## systemd
 
-`systemd/` ships a `coldsnake.service` + `coldsnake.timer` pair (nightly 05:00) and a
-`coldsnake@.service` template for running as another user.
+`systemd/` ships a `coldsnake.service` + `coldsnake.timer` pair (nightly 05:00) for a
+per-user systemd setup, and `coldsnake@.service` + `coldsnake@.timer` templates for
+running as another (dedicated) user system-wide.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -202,14 +203,51 @@ cp systemd/coldsnake.service systemd/coldsnake.timer ~/.config/systemd/user/
 systemctl --user enable --now coldsnake.timer
 ```
 
-For a system-wide install with credentials in an env file:
+For a system-wide install as a dedicated user (e.g. `backup`), use the
+`coldsnake@.service` template + `coldsnake@.timer`:
 
-```ini
-[Service]
-User=backup
-EnvironmentFile=-/home/backup/.config/coldsnake/credentials
-ExecStart=/usr/local/bin/coldsnake mirror
-```
+1. **Create the user and install ColdSnake into its venv** (the template calls the
+   venv binary directly, so no launcher or shell activation is needed):
+
+   ```bash
+   sudo useradd -m -s /usr/sbin/nologin backup
+   sudo -iu backup -- python3 -m venv ~/.local/share/coldsnake/venv
+   sudo -iu backup -- ~/.local/share/coldsnake/venv/bin/pip install --upgrade \
+       git+https://github.com/kurobeats/ColdSnake.git
+   sudo -iu backup -- ~/.local/share/coldsnake/venv/bin/coldsnake --version
+   ```
+
+2. **Configure as that user** (`sudo -iu backup`), then `chmod 0600` the config:
+
+   ```toml
+   # ~backup/.config/coldsnake/config.toml
+   [auth]
+   email = "you@example.com"
+   # or put ICEDRIVE_EMAIL / ICEDRIVE_PASSWORD in ~backup/.config/coldsnake/credentials
+
+   [[mirror]]
+   local = "/srv/data/Sync"      # the backup user must be able to read this
+   remote = "Sync"
+   ```
+
+   If the sources live outside the backup user's home, grant read access to it:
+   `sudo setfacl -R -m u:backup:rX /srv/data/Sync` (repeat after new subdirectories,
+   or use a group).
+
+3. **Install the units** (root): copy `systemd/coldsnake@.service` and
+   `systemd/coldsnake@.timer` to `/etc/systemd/system/`, then:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now coldsnake@backup.timer
+   sudo systemctl start coldsnake@backup.service     # first run, watch it
+   journalctl -u coldsnake@backup -f
+   ```
+
+   The template resolves the binary at `/home/%i/.local/share/coldsnake/venv/bin/coldsnake`
+   and reads `EnvironmentFile=-/home/%i/.config/coldsnake/credentials` (optional,
+   dash-prefixed: missing file is fine). One timer per user:
+   `systemctl enable --now coldsnake@otheruser.timer` runs a second schedule.
 
 `TimeoutStartSec=infinity` (as shipped) matters: a first full pass runs for hours,
 and systemd will not start a second copy while one is running.

@@ -8,5 +8,6 @@ Wants=network-online.target
 Type=oneshot
 User=%i
 EnvironmentFile=-/home/%i/.config/coldsnake/credentials
-ExecStart=/usr/bin/env coldsnake mirror
+# venv binary, full path: system services do not read ~/.local/bin from PATH
+ExecStart=/home/%i/.local/share/coldsnake/venv/bin/coldsnake mirror
 TimeoutStartSec=infinity
