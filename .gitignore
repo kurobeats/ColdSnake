@@ -214,6 +214,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# pi agent state (sessions, skills, subagent runs) - never part of the source
+.pi/
+.pi-agent/
+.pi-subagents/
+
 # Streamlit
 .streamlit/secrets.toml
 
