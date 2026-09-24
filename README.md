@@ -445,6 +445,18 @@ folder per call and never batches listings.
 python -m unittest discover -s tests     # 85 tests, no dependencies
 ```
 
+CI (`.github/workflows/tests.yml`) runs exactly that on every push and pull
+request, against Python 3.11, 3.12 and 3.13. The same workflow builds the
+packages, and so can you:
+
+```bash
+python -m build        # writes dist/coldsnake-0.1.0.tar.gz and .whl
+```
+
+Publication to PyPI is **not** automated: releases are built and uploaded by
+hand, so a green build means the archives are sound, not that a new version is
+out.
+
 Layout:
 
 ```

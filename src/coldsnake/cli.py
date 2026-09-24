@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -11,10 +12,69 @@ from . import __version__
 from .client import AuthError, Client, IcedriveError, TransientError
 from .sync import Mirror, PreflightError, preflight
 
+# --json moves the human log lines off stdout so a monitor reading stdout sees
+# exactly one document; reset on every main() call so runs cannot leak into each other.
+_LOG_ON_STDERR = False
+
+
 def log(message: str) -> None:
     """Unbuffered logging: under systemd/journald a block-buffered stdout hides
     progress until the process exits, which makes a stalled run look dead."""
-    print(message, flush=True)
+    print(message, file=sys.stderr if _LOG_ON_STDERR else sys.stdout, flush=True)
+
+
+class Report:
+    """The --json / --report run summary.
+
+    Assembled during the run and written once on the way out of main(), so even
+    an abort (exit 2/3) emits one complete object instead of a half document.
+    """
+
+    def __init__(self, command: str, to_stdout: bool, path: str | None):
+        self.command = command
+        self.to_stdout = to_stdout
+        self.path = path
+        self.started = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._start = time.time()
+        self.ok = True
+        self.failures = 0
+        self.error: str | None = None
+        self.storage: dict | None = None
+        self.mirrors: list[dict] = []
+
+    def document(self) -> dict:
+        doc = {"command": self.command, "version": __version__, "started": self.started,
+               "finished": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "duration_s": round(time.time() - self._start, 1),
+               "ok": self.ok, "failures": self.failures}
+        if self.command == "mirror":
+            doc["mirrors"] = self.mirrors
+        if self.storage is not None:
+            doc["storage"] = self.storage
+        if self.error is not None:
+            doc["error"] = self.error
+        return doc
+
+    def failed(self, error: str) -> None:
+        self.ok = False
+        self.error = error
+
+    def emit(self) -> None:
+        text = json.dumps(self.document())
+        if self.to_stdout:
+            print(text, flush=True)
+        if self.path:
+            with open(self.path, "w") as handle:
+                handle.write(text + "\n")
+            os.chmod(self.path, 0o644)
+
+
+def mirror_document(local: str, remote: str, stats) -> dict:
+    """One mirrors[] entry; failure paths/errors are truncated as the logs truncate them."""
+    return {"local": local, "remote": remote, "uploaded": stats.uploaded,
+            "unchanged": stats.unchanged, "bytes": stats.bytes, "verified": stats.verified,
+            "trashed": stats.trashed, "deleted": stats.deleted, "failed": stats.failed(),
+            "failures": [{"path": path, "error": error} for path, error in stats.failures]}
 
 
 DEFAULT_CONFIG = os.path.expanduser("~/.config/coldsnake/config.toml")
@@ -175,6 +235,9 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--local", help="local directory to check (with --remote)")
     check.add_argument("--remote", help="remote folder name (with --local)")
     check.add_argument("--allow-empty", action="store_true", help="tolerate empty sources")
+    check.add_argument("--json", action="store_true",
+                       help="emit one JSON summary on stdout (progress goes to stderr)")
+    check.add_argument("--report", metavar="PATH", help="also write the JSON summary to PATH")
 
     mirror = sub.add_parser("mirror", parents=[common], help="upload-only mirror local dirs into Icedrive")
     mirror.add_argument("--local", help="local directory (with --remote)")
@@ -192,6 +255,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="permanently delete pruned files instead of trashing them")
     mirror.add_argument("--no-upload-journal", action="store_true",
                         help="do not resume a partial upload from a previous run")
+    mirror.add_argument("--json", action="store_true",
+                        help="emit one JSON summary on stdout (progress goes to stderr)")
+    mirror.add_argument("--report", metavar="PATH", help="also write the JSON summary to PATH")
 
     dl = sub.add_parser("download", parents=[common], help="download from Icedrive to a local directory")
     dl.add_argument("--remote", required=True, help="remote folder name (as in [[mirror]] remote)")
@@ -208,6 +274,14 @@ def main(argv: list[str] | None = None) -> int:
     args.verbose = getattr(args, "verbose", False)
     args.config = getattr(args, "config", DEFAULT_CONFIG)
     args.no_token_cache = getattr(args, "no_token_cache", False)
+
+    # --json / --report only exist on mirror and check; absent everywhere else.
+    global _LOG_ON_STDERR
+    json_flag = getattr(args, "json", False)
+    report_path = getattr(args, "report", None)
+    report = (Report(args.command, to_stdout=json_flag, path=report_path)
+              if args.command in ("mirror", "check") and (json_flag or report_path) else None)
+    _LOG_ON_STDERR = bool(json_flag)
 
     try:
         config = load_config(args.config)
@@ -240,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
                 entries = len(os.listdir(os.path.expanduser(local)))
                 log(f"source  : {local} -> {remote} ({entries} entries)")
             log("pre-flight ok")
+            if report is not None:
+                report.storage = storage
             return 0
 
         if args.command == "ls":
@@ -383,29 +459,53 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:                            # noqa: BLE001 - one dir must not stop the rest
                 log(f"{remote}: ABORTED: {str(exc)[:200]}")
                 failures += 1
+                if report is not None:
+                    report.mirrors.append({"local": local, "remote": remote, "uploaded": 0,
+                                           "unchanged": 0, "bytes": 0, "verified": 0,
+                                           "trashed": 0, "deleted": 0, "failed": 1,
+                                           "failures": [{"path": remote, "error": str(exc)[:200]}]})
                 continue
             log(f"{remote}: uploaded {stats.uploaded} ({stats.bytes / 1e6:.1f} MB), "
                   f"unchanged {stats.unchanged}, verified {stats.verified}, "
                   f"trashed {stats.trashed}, deleted {stats.deleted}, failed {stats.failed()}")
             failures += stats.failed()
+            if report is not None:
+                report.mirrors.append(mirror_document(local, remote, stats))
         log(f"done: {failures} failure(s)")
+        if report is not None:
+            report.failures = failures
+            report.ok = failures == 0
         return 1 if failures else 0
 
     except AuthError as exc:
         log(f"authentication failed: {exc}")
+        if report is not None:
+            report.failed(str(exc))
         return 2
     except TransientError as exc:
         log(f"service unavailable, run aborted: {exc}")
+        if report is not None:
+            report.failed(str(exc))
         return 3
     except PreflightError as exc:
         log(f"pre-flight refused to start: {exc}")
+        if report is not None:
+            report.failed(str(exc))
         return 2
     except IcedriveError as exc:
         log(f"error: {exc}")
+        if report is not None:
+            report.failed(str(exc))
         return 1
     except KeyboardInterrupt:
-        print("interrupted")
+        log("interrupted")
+        if report is not None:
+            report.failed("interrupted")
         return 130
+    finally:
+        # One emit point: an abort on any path above still writes the whole document.
+        if report is not None:
+            report.emit()
 
 
 if __name__ == "__main__":
