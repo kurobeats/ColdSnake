@@ -313,6 +313,13 @@ actually needs.
 
 * **Unofficial API.** Icedrive can change or block it at any time. Failures are
   loud (exit codes, logs) rather than silent, which is the best that can be done.
+* **Icedrive's ToS does not cover this.** There is no public-API or
+  third-party-client clause, so nothing explicitly permits or forbids ColdSnake;
+  a generic "no robots or retrieval applications" clause and a
+  terminate-for-any-reason catch-all technically apply. The realistic risk is
+  endpoint breakage or an account ban, not legal action. ColdSnake mirrors from
+  live local trees, so the worst case costs a re-upload to another provider,
+  never the data itself.
 * **2FA is not implemented.** With 2FA enabled, `coldsnake login` cannot complete.
   The cached token means this only bites when the token is invalidated; otherwise
   use an account without 2FA for scheduled runs.
