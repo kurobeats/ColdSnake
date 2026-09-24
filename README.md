@@ -73,8 +73,30 @@ coldsnake mirror                             # every [[mirror]] in the config
 coldsnake mirror --local /srv/data/music --remote music
 ```
 
-Exit code is `0` on success, `1` if any file failed, `2` on auth failure, so it
-drops straight into cron, systemd or a CI job.
+Exit codes, so this drops straight into cron, systemd or a CI job:
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | ran, but some files failed |
+| 2 | refused to start: bad config, missing/unreadable/empty source, auth failure |
+| 3 | service unavailable - nothing was attempted, retry later |
+
+### Pre-flight (runs before every mirror)
+
+A long run is not started until the cheap checks pass:
+
+1. **Service health** - one authenticated call. If Icedrive is up but degraded
+   (`Fatal error encountered`, `Service temporarily unavailable`), the run stops in
+   under a second with exit 3 rather than spending hours on failed uploads.
+2. **Sources** - missing, unreadable, or *empty* source directories are refused
+   (pass `--allow-empty` to override). An empty source means the mirror would do
+   nothing - or, once pruning exists, delete things.
+3. **Config** - the same local path listed twice is refused.
+4. **Storage** - free space is checked against the bytes actually pending, once
+   the plan is known (see the quota caveat below).
+
+`coldsnake check` runs the pre-flight alone - handy as a monitoring probe.
 
 ## Behaviour worth knowing
 
