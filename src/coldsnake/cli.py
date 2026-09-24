@@ -64,9 +64,14 @@ class Report:
         if self.to_stdout:
             print(text, flush=True)
         if self.path:
-            with open(self.path, "w") as handle:
-                handle.write(text + "\n")
-            os.chmod(self.path, 0o644)
+            # A bad --report path must not turn a finished run into a crash: the
+            # run's own exit code is the signal, the report is a convenience.
+            try:
+                with open(self.path, "w") as handle:
+                    handle.write(text + "\n")
+                os.chmod(self.path, 0o644)
+            except OSError as exc:                      # noqa: BLE001
+                log(f"warning: could not write report {self.path}: {exc}")
 
 
 def mirror_document(local: str, remote: str, stats) -> dict:
@@ -74,7 +79,8 @@ def mirror_document(local: str, remote: str, stats) -> dict:
     return {"local": local, "remote": remote, "uploaded": stats.uploaded,
             "unchanged": stats.unchanged, "bytes": stats.bytes, "verified": stats.verified,
             "trashed": stats.trashed, "deleted": stats.deleted, "failed": stats.failed(),
-            "failures": [{"path": path, "error": error} for path, error in stats.failures]}
+            "failures": [{"path": path, "error": str(error)[:200]}
+                         for path, error in stats.failures]}
 
 
 DEFAULT_CONFIG = os.path.expanduser("~/.config/coldsnake/config.toml")
@@ -502,6 +508,15 @@ def main(argv: list[str] | None = None) -> int:
         if report is not None:
             report.failed("interrupted")
         return 130
+    except Exception as exc:                    # noqa: BLE001 - a CLI never tracebacks at the user
+        # Anything unforeseen (a permission error reading the config, a bug) is still
+        # a failure: log it with its type, mark the report failed, exit 1. Otherwise
+        # the report would claim ok:true while the process died.
+        detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+        log(f"error: {detail}")
+        if report is not None:
+            report.failed(detail)
+        return 1
     finally:
         # One emit point: an abort on any path above still writes the whole document.
         if report is not None:
