@@ -533,6 +533,7 @@ class Client:
         the only integrity signal it can give.
         """
         tmp = dest + ".tmp"
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         last = None
         for attempt in range(self.retries + 1):
             have = os.path.getsize(tmp) if os.path.exists(tmp) else 0

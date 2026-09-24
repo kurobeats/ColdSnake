@@ -529,6 +529,14 @@ class DownloadResumeTests(unittest.TestCase):
             self.assertEqual(handle.read(), self.payload,
                              "a body from an unexpected offset must not be appended")
 
+    def test_download_creates_missing_parent_directories(self):
+        nested = os.path.join(self.tmp.name, "deep", "deeper", "restored.bin")
+        with mock.patch("coldsnake.client.time.sleep"):
+            size = self.LocalClient(self.url).download(7, nested, size=len(self.payload))
+        self.assertEqual(size, len(self.payload))
+        with open(nested, "rb") as handle:
+            self.assertEqual(handle.read(), self.payload)
+
     def test_short_transfer_never_commits_a_bad_file(self):
         type(self).Handler.always_cut = True
         with mock.patch("coldsnake.client.time.sleep"):
