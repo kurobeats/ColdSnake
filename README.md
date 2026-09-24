@@ -8,7 +8,7 @@ no third-party binaries, no dependencies beyond the standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs). 28 unit tests.
+verification, idempotent re-runs). 33 unit tests.
 
 ## Why this exists
 
@@ -157,14 +157,15 @@ probe.
 * **Incremental.** Uploads only when size or mtime differ (mtime tolerance 2 s).
   Icedrive preserves the upload-time mtime, so a second run is nearly free: a
   2 583-file tree re-checks in ~56 s and uploads nothing.
-* **Additive.** No deletes are ever issued. A file removed locally stays remote.
-  (Pruning is designed but not implemented - see Roadmap.)
+* **Additive.** No deletes are ever issued unless `--prune` is passed. A file
+  removed locally stays remote by default.
 * **Chunked and resumable.** Files larger than `chunk_size` (8 MiB by default) are
   uploaded as ranged chunks: a stall costs one chunk, not a 4 GB file.
 * **Streams.** File bodies are streamed through one request with a known
   `Content-Length`; process memory does not scale with file size.
 * **Verifies.** After uploading, each folder written to is re-listed and file sizes
-  are compared. Mismatches are reported as failures, not swallowed.
+  are compared. A download is sized against the listing and resumed from its
+  partial `.tmp` on retry. Mismatches are reported as failures, not swallowed.
 * **Retries.** Transport errors (5xx/429/522, timeouts) retry with backoff; an
   auth error triggers one fresh login; API-reported outages retry slowly (30 s ×
   attempt) rather than hammering.
@@ -298,8 +299,8 @@ actually needs.
 | recursive listing, folder creation | yes |
 | streamed uploads, keep-alive | yes |
 | chunked / resumable uploads | yes - stable id, idempotent range retries |
-| post-upload verification | yes (sizes; hashes not available without download) |
-| download / restore | yes - `coldsnake download`, signed `/download-multi` URLs (verified live) |
+| post-upload verification | yes - sizes, uploads and downloads (no hash exists to compare) |
+| download / restore | yes - `coldsnake download`, signed `/download-multi` URLs (verified live), resumable via `Range` |
 | storage quota check | yes - pre-flight gate + `coldsnake account` |
 | retries, backoff, per-file isolation | yes |
 | prune local deletions | yes - opt-in `--prune`, guarded, files only |
@@ -323,9 +324,14 @@ actually needs.
 * **2FA is not implemented.** With 2FA enabled, `coldsnake login` cannot complete.
   The cached token means this only bites when the token is invalidated; otherwise
   use an account without 2FA for scheduled runs.
-* **Download has no resume.** `coldsnake download` fetches a signed URL from
-  `/download-multi` (verified live with a sha256 round-trip) and streams the file.
-  A retry restarts the whole file; ranged/chunked download is on the roadmap.
+* **Download is resumed and size-checked, not hash-checked.** `coldsnake download`
+  fetches a signed URL from `/download-multi` (verified live with a sha256
+  round-trip) and streams it. The signed URL honours `Range` (the same trick
+  go-icedrive uses), so a retry continues the partial `.tmp` instead of
+  restarting a multi-GB file, and a server that ignores the range is detected and
+  restarted rather than appended to. The finished length is compared against the
+  size from the listing, so a truncated transfer fails instead of landing. There
+  is no per-file hash to compare, so same-size corruption still passes.
 * **Folders cannot be deleted** through this API: `/erase` reports success and the
   folder stays. Files delete fine (verified live), which is what `--prune` uses.
   Empty remote directories linger.
@@ -346,19 +352,25 @@ actually needs.
 
 ## Roadmap
 
-1. **Download resume** - ranged download for large files (the official client
-   chunks its downloads), which also unlocks content-hash verification.
-2. **Hash integrity** - the upload path accepts a `hashAlgorithm` field; sending and
-   comparing hashes would catch same-size corruption that the size check misses.
-3. Smaller items: `collection-tree-full` for cheaper full-tree listing (present in
-   the official client's protocol), confirm listing pagination on very large folders
-   (~1 200 entries per folder is currently proven fine), structured/JSON run
-   summaries for monitoring, PyPI packaging and CI.
+1. **Verify a content hash - blocked on whether the API has one.** Nothing is
+   available to compare against today: the desktop client's upload request sends
+   no hash field (its literal multipart fields are `unique_upload_id`, `files[]`,
+   `X-Icedrive-Padding` and `Content-Range`), and listing entries carry no hash
+   key. So integrity stays length-based. An earlier note here claiming the upload
+   path accepts a `hashAlgorithm` field is **unconfirmed** - settling it needs one
+   live probe (upload with the field, inspect the stored entry), not reverse
+   engineering. Until then hashes would only catch same-size corruption.
+2. **Collection-tree-full** for a cheaper full-tree listing (present in the
+   official client's protocol), which would also make `download` and `--prune`
+   single-request instead of one listing per folder.
+3. Smaller items: confirm listing pagination on very large folders (~1 200 entries
+   per folder is currently proven fine), structured/JSON run summaries for
+   monitoring, PyPI packaging and CI.
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 28 tests, no dependencies
+python -m unittest discover -s tests     # 33 tests, no dependencies
 ```
 
 Layout:
@@ -368,7 +380,8 @@ src/coldsnake/client.py   API client: PoW login, listing, folders, chunked uploa
 src/coldsnake/sync.py     mirror logic, pre-flight checks, verification
 src/coldsnake/cli.py      argument parsing, config, credentials/token/device-id
 tests/test_coldsnake.py   proof-of-work, chunk planning, payload validation,
-                          pre-flight, mirror behaviour (against an in-memory client)
+                          pre-flight, mirror behaviour (against an in-memory client),
+                          ranged download resume (against a local HTTP server)
 ```
 
 Tests must pass before a change lands. The mirror tests use an in-memory fake, so

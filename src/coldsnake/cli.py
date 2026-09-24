@@ -230,7 +230,8 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     found.add(child_rel)
                     try:
-                        size = client.download(entry["id"], os.path.join(dest_root, child_rel))
+                        size = client.download(entry["id"], os.path.join(dest_root, child_rel),
+                                               size=int(entry.get("filesize") or 0) or None)
                         log(f"downloaded {child_rel} ({size} bytes)")
                     except Exception as exc:                    # noqa: BLE001 - isolate per file
                         failures += 1

@@ -1,11 +1,15 @@
 """Tests for the pure logic: proof-of-work grading and mirror decisions."""
 import base64
 import hashlib
+import http.server
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -367,6 +371,129 @@ class CliExitCodeTests(unittest.TestCase):
         finally:
             os.unlink(path)
             os.rmdir(home)
+
+
+class DownloadResumeTests(unittest.TestCase):
+    """Signed URLs honour Range, so a retry must continue the partial .tmp.
+
+    Real HTTP against a local server: this is the one path where "did it resume?"
+    cannot be faked by an in-memory client, and a wrong answer corrupts files.
+    """
+
+    payload = bytes(range(256)) * 800          # 204 800 bytes
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        payload = b""
+        requests = []
+        honour_range = True
+        spoof_range_start = False
+        cut_first = 0
+        always_cut = False
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            type(self).requests.append(self.headers.get("Range"))
+            start = 0
+            rng = self.headers.get("Range")
+            if type(self).spoof_range_start and rng:
+                # a 206 whose Content-Range claims a start we did not ask for
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes 0-{len(type(self).payload) - 1}/{len(type(self).payload)}")
+            elif rng and rng.startswith("bytes=") and type(self).honour_range:
+                start = int(rng.split("=", 1)[1].split("-", 1)[0])
+                self.send_response(206)
+                self.send_header("Content-Range",
+                                 f"bytes {start}-{len(type(self).payload) - 1}/{len(type(self).payload)}")
+            else:
+                self.send_response(200)
+            body = type(self).payload[start:]
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            cut = type(self).always_cut or (type(self).cut_first and len(type(self).requests) == 1)
+            if cut:
+                self.wfile.write(body[:type(self).cut_first or 1024])
+                self.wfile.flush()
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
+            self.wfile.write(body)
+
+    class LocalClient(Client):
+        def __init__(self, url, **kwargs):
+            super().__init__("a@b.c", "pw", log=lambda *_: None, **kwargs)
+            self.url = url
+
+        def download_url(self, file_id):
+            return self.url
+
+    def setUp(self):
+        handler = type(self).Handler
+        handler.payload = self.payload
+        handler.requests = []
+        handler.honour_range = True
+        handler.spoof_range_start = False
+        handler.cut_first = 0
+        handler.always_cut = False
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/signed"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dest = os.path.join(self.tmp.name, "restored.bin")
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def test_truncated_transfer_resumes_and_lands_complete(self):
+        type(self).Handler.cut_first = 50_000
+        with mock.patch("coldsnake.client.time.sleep"):
+            size = self.LocalClient(self.url, retries=2).download(7, self.dest, size=len(self.payload))
+        self.assertEqual(size, len(self.payload))
+        with open(self.dest, "rb") as handle:
+            self.assertEqual(handle.read(), self.payload, "resumed file must be byte-exact")
+        self.assertEqual(type(self).Handler.requests[1], "bytes=50000-",
+                         "retry must ask for exactly the missing range")
+
+    def test_server_ignoring_range_starts_over_instead_of_duplicating(self):
+        type(self).Handler.honour_range = False
+        with open(self.dest + ".tmp", "wb") as handle:
+            handle.write(b"junk" * 4)               # stale partial from an earlier run
+        with mock.patch("coldsnake.client.time.sleep"):
+            self.LocalClient(self.url).download(7, self.dest, size=len(self.payload))
+        with open(self.dest, "rb") as handle:
+            self.assertEqual(handle.read(), self.payload)
+
+    def test_complete_partial_is_renamed_without_a_request(self):
+        with open(self.dest + ".tmp", "wb") as handle:
+            handle.write(self.payload)
+        size = self.LocalClient(self.url).download(7, self.dest, size=len(self.payload))
+        self.assertEqual(size, len(self.payload))
+        self.assertEqual(type(self).Handler.requests, [])
+
+    def test_a_misreported_range_is_not_appended_to(self):
+        type(self).Handler.spoof_range_start = True
+        with open(self.dest + ".tmp", "wb") as handle:
+            handle.write(b"junk" * 4)
+        with mock.patch("coldsnake.client.time.sleep"):
+            self.LocalClient(self.url).download(7, self.dest, size=len(self.payload))
+        with open(self.dest, "rb") as handle:
+            self.assertEqual(handle.read(), self.payload,
+                             "a body from an unexpected offset must not be appended")
+
+    def test_short_transfer_never_commits_a_bad_file(self):
+        type(self).Handler.always_cut = True
+        with mock.patch("coldsnake.client.time.sleep"):
+            with self.assertRaises(IcedriveError) as ctx:
+                self.LocalClient(self.url, retries=1).download(7, self.dest, size=len(self.payload))
+        self.assertIn("download failed", str(ctx.exception))
+        self.assertFalse(os.path.exists(self.dest), "a truncated download must not land")
 
 
 if __name__ == "__main__":

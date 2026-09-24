@@ -507,27 +507,55 @@ class Client:
         url = urls[0]["url"]
         return url if url.startswith("https://") else "https://apis.icedrive.net" + url
 
-    def download(self, file_id: int, dest: str) -> int:
+    def download(self, file_id: int, dest: str, size: int | None = None) -> int:
         """Stream one file to dest (via .tmp + rename). Returns bytes written.
-        ponytail: no Range resume - a retry restarts the file. The official
-        client chunks downloads; add resume if long-haul failures hurt."""
+
+        Resumes: the signed URL honours Range (verified against the live account
+        and go-icedrive's range HEAD), so a retry continues the partial .tmp
+        instead of restarting a multi-GB file. The finished length is checked
+        against the known size - the API exposes no per-file hash, so length is
+        the only integrity signal it can give.
+        """
+        tmp = dest + ".tmp"
         last = None
         for attempt in range(self.retries + 1):
-            tmp = dest + ".tmp"
+            have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+            if size and have >= size:              # a previous attempt fetched it all
+                os.replace(tmp, dest)
+                return size
             try:
                 request = urllib.request.Request(self.download_url(file_id), method="GET")
                 for key, value in self._identity().items():
                     if key != "Authorization":            # the URL itself carries the signature
                         request.add_header(key, value)
+                if have:
+                    request.add_header("Range", f"bytes={have}-")
                 with urllib.request.urlopen(request, context=self._context, timeout=self.timeout) as response:
-                    with open(tmp, "wb") as handle:
+                    # Trust the range only if the server confirms the start we asked
+                    # for: appending a wrongly-ranged body would corrupt the file.
+                    content_range = (response.headers.get("Content-Range") or "").split(" ")[-1]
+                    start = content_range.split("-", 1)[0]
+                    resumed = response.status == 206 and start.isdigit() and int(start) == have
+                    if resumed and have:
+                        handle = open(tmp, "ab")
+                    else:                    # no Range support (or a wrong one): start over
+                        have, handle = 0, open(tmp, "wb")
+                    length = response.headers.get("Content-Length")
+                    total = size if size else (have + int(length) if length else None)
+                    with handle:
                         while True:
                             block = response.read(STREAM_CHUNK)
                             if not block:
                                 break
                             handle.write(block)
-                os.replace(tmp, dest)
-                return os.stat(dest).st_size
+                written = os.path.getsize(tmp)
+                if total is not None and written != total:
+                    if written > total:            # corrupt, not partial: do not resume onto it
+                        os.remove(tmp)
+                    last = f"incomplete: {written} of {total} bytes"
+                else:
+                    os.replace(tmp, dest)
+                    return written
             except urllib.error.HTTPError as exc:
                 last = exc
                 if exc.code not in RETRY_STATUS:
