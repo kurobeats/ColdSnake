@@ -32,7 +32,11 @@ import uuid
 
 API = "https://apis.icedrive.net/v3/mobile"
 USER_AGENT = "icedrive-ios/2.3.1"
-TIMEOUT = 600
+# Socket timeouts are inactivity timeouts: as long as bytes flow, a large upload
+# is fine. They are deliberately short so a stalled server surfaces as a retryable
+# failure instead of hanging the run.
+CONTROL_TIMEOUT = 60
+UPLOAD_TIMEOUT = 120
 STREAM_CHUNK = 1024 * 1024
 RETRY_STATUS = (429, 500, 502, 503, 504, 522, 524)
 
@@ -47,6 +51,22 @@ class AuthError(IcedriveError):
 
 def now() -> str:
     return time.strftime("%F %T")
+
+
+# The API reports failures with HTTP 200 and an error payload, so responses must
+# be checked or a failed listing looks like an empty folder.
+AUTH_ERROR_CODES = (1001, 1010, 2001)
+
+
+def check_payload(data):
+    """Raise if an API response body is an error document."""
+    if isinstance(data, dict) and data.get("error"):
+        code = data.get("code")
+        message = data.get("message") or "unknown error"
+        if code in AUTH_ERROR_CODES:
+            raise AuthError(f"auth error {code}: {message}")
+        raise IcedriveError(f"API error {code}: {message}")
+    return data
 
 
 def leading_zero_bits(data: bytes) -> int:
@@ -105,30 +125,45 @@ class Client:
     """Minimal Icedrive client. Log in once, then list/create/upload."""
 
     def __init__(self, email: str, password: str, verbose: bool = False,
-                 timeout: int = TIMEOUT, retries: int = 3, log=print):
+                 timeout: int = CONTROL_TIMEOUT, upload_timeout: int = UPLOAD_TIMEOUT,
+                 retries: int = 3, device_id: str | None = None, log=print):
         self.email = email
         self.password = password
         self.verbose = verbose
         self.timeout = timeout
+        self.upload_timeout = upload_timeout
         self.retries = retries
+        # The official clients identify themselves with a stable device id and an
+        # X-App-Method header; matching that seems prudent when the API throttles.
+        self.device_id = device_id
         self.log = log
         self.token: str | None = None
+        self.account: dict | None = None
         self._context = ssl.create_default_context()
         self._endpoints: list[str] = []
         self._endpoints_at = 0.0
+        self._connections: dict[str, http.client.HTTPSConnection] = {}
 
     # --- transport -------------------------------------------------------
+    def _identity(self) -> dict:
+        headers = {"User-Agent": USER_AGENT, "Accept": "*/*", "X-App-Method": "sync"}
+        if self.device_id:
+            headers["X-Icedrive-Device-Id"] = self.device_id
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        return headers
+
     def _request(self, url, body=None, content_type=None, method="GET", auth=True):
         request = urllib.request.Request(url, data=body, method=method)
-        request.add_header("User-Agent", USER_AGENT)
-        request.add_header("Accept", "*/*")
+        for key, value in self._identity().items():
+            if key == "Authorization" and not auth:
+                continue
+            request.add_header(key, value)
         if content_type:
             request.add_header("Content-Type", content_type)
-        if auth and self.token:
-            request.add_header("Authorization", "Bearer " + self.token)
         with urllib.request.urlopen(request, context=self._context, timeout=self.timeout) as response:
             raw = response.read()
-        return json.loads(raw) if raw.lstrip().startswith(b"{") else raw
+        return check_payload(json.loads(raw)) if raw.lstrip().startswith(b"{") else raw
 
     def _retry(self, operation, auth: bool):
         """Run operation, retrying 5xx/429/network errors; re-login once on 401/403."""
@@ -136,6 +171,13 @@ class Client:
         for attempt in range(self.retries + 1):
             try:
                 return operation()
+            except AuthError as exc:
+                last = exc
+                if auth:
+                    self.log(f"[{now()}] auth error ({exc}); logging in again")
+                    self.login()
+                    continue
+                raise
             except urllib.error.HTTPError as exc:
                 last = f"HTTP {exc.code} {exc.reason}"
                 if exc.code in (401, 403) and auth:
@@ -154,6 +196,8 @@ class Client:
         return self._retry(lambda: self._request(API + path, body, content_type, method, auth), auth)
 
     # --- auth ------------------------------------------------------------
+    _token_path: str | None = None
+
     def login(self) -> dict:
         body, content_type = _urlencode({"app": "ios", "request": "pow-new", "scope": "login"})
         challenge = self._retry(
@@ -168,12 +212,59 @@ class Client:
         if not isinstance(result, dict) or not result.get("token"):
             raise AuthError(f"login failed: {json.dumps(result)[:200]}")
         self.token = result["token"]
+        self.account = result.get("auth_data")
         self._endpoints, self._endpoints_at = [], 0.0
+        if self._token_path:
+            try:
+                self.save_token(self._token_path)
+            except OSError as exc:
+                self.log(f"warning: could not cache token: {exc}")
         if self.verbose:
             auth = result.get("auth_data", {})
             self.log(f"[{now()}] logged in as {auth.get('email')} "
                      f"(plan {auth.get('plan')}, id {auth.get('id')})")
         return result
+
+    def user_stats(self) -> dict:
+        """Storage/bandwidth usage: {storage: {used, max, free, pcent}, bandwidth: {...}}."""
+        return self.call("/user-stats")
+
+    # --- token cache -----------------------------------------------------
+    def save_token(self, path: str) -> None:
+        """Cache the bearer token plus the account info the login returned, so a
+        scheduled run rarely needs to log in (login is the 2FA-protected step)."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            json.dump({"token": self.token, "account": self.account}, handle)
+        os.chmod(path, 0o600)
+
+    def load_token(self, path: str, validate=None) -> bool:
+        """validate: callable that raises if the token is not usable (defaults to
+        a user-stats call, injected in tests to avoid network access)."""
+        if not os.path.exists(path):
+            return False
+        with open(path) as handle:
+            raw = handle.read().strip()
+        if not raw:
+            return False
+        account = None
+        try:
+            cached = json.loads(raw)
+            token, account = cached.get("token"), cached.get("account")
+        except json.JSONDecodeError:                            # older bare-token cache
+            token = raw
+        if not token:
+            return False
+        self.token, self.account = token, account
+        validate = validate or self.user_stats
+        try:
+            validate()                                          # cheapest authenticated call
+        except Exception:                                       # noqa: BLE001 - fall back to a fresh login
+            self.token, self.account = None, None
+            return False
+        if self.verbose:
+            self.log(f"[{now()}] reusing cached bearer token")
+        return True
 
     # --- folders ---------------------------------------------------------
     def listing(self, folder_id: int = 0) -> list[dict]:
@@ -214,6 +305,25 @@ class Client:
         self._endpoints, self._endpoints_at = endpoints, time.time()
         return list(endpoints)
 
+    # --- connection reuse ------------------------------------------------
+    def _connection(self, netloc: str) -> http.client.HTTPSConnection:
+        """Keep-alive connection per storage node: a fresh TLS handshake per file
+        is what makes many-small-file mirrors slow (measured ~0.5 files/s)."""
+        conn = self._connections.get(netloc)
+        if conn is not None and conn.sock is not None:
+            return conn
+        conn = http.client.HTTPSConnection(netloc, timeout=self.upload_timeout, context=self._context)
+        self._connections[netloc] = conn
+        return conn
+
+    def _drop_connection(self, netloc: str) -> None:
+        conn = self._connections.pop(netloc, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:                                   # noqa: BLE001
+                pass
+
     def upload(self, folder_id: int, path: str) -> dict:
         """Stream one file to a signed /deposit endpoint. Constant memory."""
         stat = os.stat(path)
@@ -229,15 +339,18 @@ class Client:
         length = len(preamble) + stat.st_size + len(trailer)
         last = None
 
+        if self.verbose:
+            self.log(f"  uploading {os.path.basename(path)} ({stat.st_size} bytes)")
         for attempt in range(self.retries + 1):
             for endpoint in self.upload_endpoints():
                 parsed = urllib.parse.urlsplit(endpoint)
                 target = parsed.path + ("?" + parsed.query if parsed.query else "")
                 conn = None
                 try:
-                    conn = http.client.HTTPSConnection(parsed.netloc, timeout=self.timeout, context=self._context)
+                    conn = self._connection(parsed.netloc)
                     conn.putrequest("POST", target)
-                    conn.putheader("User-Agent", USER_AGENT)
+                    for key, value in self._identity().items():
+                        conn.putheader(key, value)
                     conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
                     conn.putheader("Content-Length", str(length))
                     conn.endheaders()
@@ -261,12 +374,8 @@ class Client:
                     return result
                 except Exception as exc:                        # noqa: BLE001 - try the next mirror
                     last = exc
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:                       # noqa: BLE001
-                            pass
+                    self._drop_connection(parsed.netloc)
+                    continue
             if attempt < self.retries:
                 time.sleep(2 ** attempt)
                 self._endpoints, self._endpoints_at = [], 0.0

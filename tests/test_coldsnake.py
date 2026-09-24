@@ -8,7 +8,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from coldsnake.client import leading_zero_bits, solve_pow          # noqa: E402
+from coldsnake.client import (AuthError, Client, IcedriveError, check_payload,  # noqa: E402
+                              leading_zero_bits, solve_pow)
 from coldsnake.sync import Mirror                                  # noqa: E402
 
 
@@ -60,6 +61,33 @@ class ProofOfWorkTests(unittest.TestCase):
         self.assertGreaterEqual(leading_zero_bits(digest), 12)
         self.assertEqual(digest.hex(), proof["hash"])
         self.assertEqual(proof["ver"], "1")
+
+
+class PayloadValidationTests(unittest.TestCase):
+    """The API signals failure with HTTP 200 + an error body."""
+
+    def test_ok_payload_passes_through(self):
+        self.assertEqual(check_payload({"error": False, "data": [1]}), {"error": False, "data": [1]})
+
+    def test_error_payload_raises(self):
+        with self.assertRaises(IcedriveError):
+            check_payload({"error": True, "code": 2003, "message": "Invalid request"})
+
+    def test_auth_error_payload_raises_auth_error(self):
+        with self.assertRaises(AuthError):
+            check_payload({"error": True, "code": 1001, "message": "Not authenticated"})
+
+    def test_expired_token_does_not_load_from_cache(self):
+        client = Client("a@b.c", "pw")
+        client.token = "stale"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "token")
+            client.save_token(path)
+
+            def reject():
+                raise AuthError("token expired")
+
+            self.assertFalse(Client("a@b.c", "pw").load_token(path, validate=reject))
 
 
 class MirrorTests(unittest.TestCase):
@@ -115,6 +143,54 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(stats.uploaded, 0)
         self.assertEqual(client.uploads, [])
         self.assertEqual(client.tree[0], [])
+
+
+class QuotaGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        with open(os.path.join(self.tmp.name, "a.bin"), "wb") as handle:
+            handle.write(b"x" * 1024)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_quota_gate_blocks_upload_when_space_is_short(self):
+        calls = []
+
+        def gate(needed):
+            calls.append(needed)
+            raise RuntimeError("not enough space")
+
+        mirror = Mirror(FakeClient(), self.tmp.name, "Remote", log=lambda *_: None, quota_check=gate)
+        with self.assertRaises(RuntimeError):
+            mirror.run()
+        self.assertEqual(calls, [1024], "gate must be asked once, with the bytes needed")
+
+    def test_quota_gate_sees_exactly_the_pending_bytes(self):
+        client = FakeClient()
+        seen = []
+        mirror = Mirror(client, self.tmp.name, "Remote", log=lambda *_: None,
+                        quota_check=lambda needed: seen.append(needed))
+        mirror.run()
+        self.assertEqual(seen, [1024])
+        # second run: nothing pending, so the gate is not consulted
+        seen.clear()
+        Mirror(client, self.tmp.name, "Remote", log=lambda *_: None,
+               quota_check=lambda needed: seen.append(needed)).run()
+        self.assertEqual(seen, [])
+
+    def test_token_cache_round_trip(self):
+        path = os.path.join(self.tmp.name, "token")
+        client = Client("a@b.c", "pw")
+        client.token = "tok123"
+        client.account = {"email": "a@b.c", "plan": "Pro"}
+        client.save_token(path)
+        self.assertEqual(oct(os.stat(path).st_mode)[-3:], "600", "token cache must be 0600")
+
+        same = Client("a@b.c", "pw")
+        self.assertTrue(same.load_token(path, validate=lambda: None))
+        self.assertEqual(same.token, "tok123")
+        self.assertEqual(same.account["plan"], "Pro")
 
 
 if __name__ == "__main__":

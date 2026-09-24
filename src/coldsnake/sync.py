@@ -34,13 +34,14 @@ class Mirror:
     """Mirror one local directory tree into one remote folder."""
 
     def __init__(self, client: Client, root: str, remote: str,
-                 dry_run: bool = False, verbose: bool = False, log=print):
+                 dry_run: bool = False, verbose: bool = False, log=print, quota_check=None):
         self.client = client
         self.root = root
         self.remote = remote
         self.dry_run = dry_run
         self.verbose = verbose
         self.log = log
+        self.quota_check = quota_check      # callable(needed_bytes) -> None, may raise
         self.stats = Stats()
         self._folder_ids: dict[str, int] = {}
         self._listings: dict[str, list[dict]] = {}
@@ -106,6 +107,10 @@ class Mirror:
             if rel_dir:
                 self.folder_id(rel_dir)
 
+        # Plan first: needed bytes are known before anything is uploaded, so a
+        # full drive (or a bad path) fails fast instead of after thousands of
+        # failed uploads.
+        plan = []
         for rel in sorted(files):
             path = os.path.join(self.root, rel)
             try:
@@ -114,6 +119,20 @@ class Mirror:
                 if not needed:
                     self.stats.unchanged += 1
                     continue
+                plan.append((rel, stat, reason))
+            except Exception as exc:                            # noqa: BLE001 - isolate per file
+                self.stats.failures.append((rel, str(exc)[:200]))
+                self.log(f"  FAILED {rel}: {str(exc)[:200]}")
+
+        to_upload = sum(stat.st_size for _, stat, _ in plan)
+        if plan:
+            self.log(f"[{self.remote}] {len(plan)} file(s) to upload, {to_upload / 1e6:.1f} MB")
+            if self.quota_check and not self.dry_run:
+                self.quota_check(to_upload)
+
+        for rel, stat, reason in plan:
+            path = os.path.join(self.root, rel)
+            try:
                 if self.dry_run:
                     self.log(f"  would upload {rel} ({reason}, {stat.st_size} bytes)")
                     continue
