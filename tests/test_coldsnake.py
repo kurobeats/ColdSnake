@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from coldsnake.client import (AuthError, Client, IcedriveError, check_payload,  # noqa: E402
-                              leading_zero_bits, solve_pow)
+                              chunk_ranges, leading_zero_bits, solve_pow, upload_id_for)
 from coldsnake.sync import Mirror                                  # noqa: E402
 
 
@@ -61,6 +61,24 @@ class ProofOfWorkTests(unittest.TestCase):
         self.assertGreaterEqual(leading_zero_bits(digest), 12)
         self.assertEqual(digest.hex(), proof["hash"])
         self.assertEqual(proof["ver"], "1")
+
+
+class ChunkingTests(unittest.TestCase):
+    """Ranged chunks keyed by unique_upload_id are what make a stall cheap."""
+
+    def test_ranges_cover_the_file_exactly(self):
+        self.assertEqual(chunk_ranges(10, 4), [(0, 4), (4, 4), (8, 2)])
+        self.assertEqual(chunk_ranges(8, 4), [(0, 4), (4, 4)])
+        self.assertEqual(chunk_ranges(3, 4), [(0, 3)])
+        sizes = [length for _, length in chunk_ranges(8388608 * 3 + 17, 8388608)]
+        self.assertEqual(sum(sizes), 8388608 * 3 + 17)
+        self.assertEqual(len(sizes), 4)
+
+    def test_upload_id_is_stable_for_the_same_content(self):
+        first = upload_id_for(42, "/data/big.bin", 1024, 1700000000)
+        self.assertEqual(first, upload_id_for(42, "/other/dir/big.bin", 1024, 1700000000))
+        self.assertNotEqual(first, upload_id_for(42, "/data/big.bin", 1025, 1700000000))
+        self.assertNotEqual(first, upload_id_for(43, "/data/big.bin", 1024, 1700000000))
 
 
 class PayloadValidationTests(unittest.TestCase):
