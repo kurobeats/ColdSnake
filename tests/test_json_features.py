@@ -194,5 +194,76 @@ class JsonCheckTests(unittest.TestCase):
             self.assertEqual(doc["storage"]["free_human"], "1 TB")
 
 
+class JsonRobustnessTests(unittest.TestCase):
+    """The report must survive a bad path, an interrupted run and a buggy client."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        os.makedirs(self.src)
+        with open(os.path.join(self.src, "a.txt"), "w") as handle:
+            handle.write("x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def mirror_argv(self, *extra):
+        return ["mirror", "--local", self.src, "--remote", "R",
+                "--no-upload-journal", *extra]
+
+    def test_interrupt_still_emits_one_document(self):
+        class Interrupted:
+            def __init__(self, client, local, remote, **kwargs):
+                pass
+
+            def run(self):
+                raise KeyboardInterrupt
+
+        code, out, _ = run(self.mirror_argv("--json"), mirror=Interrupted)
+        self.assertEqual(code, 130)
+        doc = json.loads(out)
+        self.assertIs(doc["ok"], False)
+        self.assertEqual(doc["error"], "interrupted")
+
+    def test_report_written_on_the_outage_path(self):
+        class DownClient(FakeClient):
+            def probe(self):
+                raise cli.TransientError("Service temporarily unavailable")
+
+        path = os.path.join(self.tmp.name, "report.json")
+        code, out, _ = run(self.mirror_argv("--json", "--report", path), client=DownClient())
+        self.assertEqual(code, 3)
+        self.assertEqual(read_json(path), json.loads(out), "file must match stdout, even on exit 3")
+
+    def test_unexpected_error_is_reported_as_a_failure_not_a_success(self):
+        class BrokenClient(FakeClient):
+            def probe(self):
+                raise ValueError("something unforeseen")
+
+        code, out, err = run(self.mirror_argv("--json"), client=BrokenClient())
+        self.assertEqual(code, 1)
+        doc = json.loads(out)
+        self.assertIs(doc["ok"], False, "a crash must never be reported as ok")
+        self.assertIn("ValueError", doc["error"])
+        self.assertIn("error:", err)
+
+    def test_bad_report_path_does_not_break_a_good_run(self):
+        missing = os.path.join(self.tmp.name, "nope", "report.json")
+        code, out, err = run(self.mirror_argv("--json", "--report", missing),
+                             mirror=fake_mirror(FakeStats()))
+        self.assertEqual(code, 0, "a bad --report path is not a run failure")
+        self.assertIs(json.loads(out)["ok"], True)
+        self.assertIn("could not write report", err)
+
+    def test_json_flag_does_not_leak_into_the_next_run(self):
+        first, out, _ = run(self.mirror_argv("--json"), mirror=fake_mirror(FakeStats()))
+        self.assertEqual(first, 0)
+        json.loads(out)                                  # pure JSON on stdout
+        second, out2, _ = run(self.mirror_argv(), mirror=fake_mirror(FakeStats()))
+        self.assertEqual(second, 0)
+        self.assertIn("R: uploaded 3", out2, "human output must be back on stdout")
+        self.assertRaises(ValueError, json.loads, out2)
+
+
 if __name__ == "__main__":
     unittest.main()
