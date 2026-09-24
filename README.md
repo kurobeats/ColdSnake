@@ -38,6 +38,31 @@ Running from a checkout without installing:
 PYTHONPATH=src python3 -m coldsnake.cli --help
 ```
 
+### Self-contained venv install
+
+To keep everything under one directory (no site-packages, no pipx) and still have
+`coldsnake` on PATH, use a launcher script:
+
+```bash
+python3 -m venv ~/.local/share/coldsnake/venv
+~/.local/share/coldsnake/venv/bin/pip install --upgrade ~/src/ColdSnake
+```
+
+`~/.local/bin/coldsnake` (chmod 0755):
+
+```sh
+#!/bin/sh
+# activate the venv, then run the CLI from it
+VENV="$HOME/.local/share/coldsnake/venv"
+[ -x "$VENV/bin/coldsnake" ] || { echo "coldsnake: no venv at $VENV" >&2; exit 2; }
+. "$VENV/bin/activate"
+exec "$VENV/bin/coldsnake" "$@"
+```
+
+That gives interactive use the venv's `python`/`pip` while keeping the install
+contained; systemd should call the venv binary directly (`ExecStart=…/venv/bin/coldsnake`)
+since a unit needs no shell activation.
+
 ## Credentials
 
 Resolved in this order:
