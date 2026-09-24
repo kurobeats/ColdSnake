@@ -3,7 +3,8 @@
 A python icedrive client.
 
 Upload-only mirroring, folder listing and proof-of-work login for Icedrive, driven
-directly against the v3 mobile API that Icedrive's own apps use. No WebDAV, no GUI,
+directly against the v3 mobile API that Icedrive's own apps use - plus download and
+restore, a recoverable trash, version history, and batched deletes. No WebDAV, no GUI,
 no third-party binaries, no dependencies beyond the standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
@@ -168,6 +169,14 @@ probe.
 * **Additive.** No remote item is removed unless `--prune` is passed - and then it
   is trashed (recoverable) unless `--prune-delete` is set. A file removed locally
   stays remote by default.
+* **Deletes are revertible and batched.** `coldsnake trash` lists what a prune (or
+  your own `Client.trash`) put in the remote trash, `coldsnake restore --id <id>`
+  puts it back where it was, and `--prune-delete` erases a whole batch with one
+  `POST /erase` carrying comma-joined ids.
+* **Version history is readable.** Icedrive keeps previous revisions of an
+  overwritten file: `coldsnake versions --remote NAME --file RELPATH` lists them and
+  `coldsnake download ... --version N` fetches one, byte-for-byte from that
+  revision's own signed URL.
 * **Chunked and resumable.** Files larger than `chunk_size` (8 MiB by default) are
   uploaded as ranged chunks: a stall costs one chunk, not a 4 GB file.
 * **Streams.** File bodies are streamed through one request with a known
@@ -272,11 +281,17 @@ POST /api  {app:ios, request:pow-new, scope:login}      -> proof-of-work challen
 POST /api  {password, email, pow_proof, request:login}  -> bearer token
 GET  /user-stats                                        -> storage + bandwidth usage
 GET  /collection?type=cloud&folderId=<id>               -> folder listing
+GET  /collection?type=trash&folderId=0                  -> trash listing
+POST /api  {request:trash-add, items:file-<id>}         -> move an item to the trash
+POST /api  {request:trash-restore, items:file-<id>}     -> restore it to its folder
 POST /folder-create (multipart)                         -> create a folder
 GET  /geo-fileserver-list?app=ios&pow_proof=<b64>       -> signed /deposit endpoints
 POST <deposit endpoint> multipart {folderId, moddate, files[]}          -> whole file
 POST <deposit endpoint> multipart {folderId, moddate, unique_upload_id,
                                    files[]} + Content-Range: bytes a-b/total -> chunk
+GET  /download?id=<id>                                  -> signed node url for the file
+GET  /version-list?id=<id>                              -> revision list, each with its own url
+POST /erase  {items:file-<id>[,file-<id>…]}             -> delete one file or a batch
 ```
 
 Details that matter:
@@ -293,7 +308,19 @@ Details that matter:
   parts`). So the id is derived from destination + size + mtime and reused across
   retries and runs, and the end-of-upload size check is mandatory.
 * **Client identity** - Icedrive's own clients send `X-App-Method: sync` and a stored
-  `X-Icedrive-Device-Id`; ColdSnake sends both.
+  `X-Icedrive-Device-Id`; ColdSnake sends both. The User-Agent matters: a desktop
+  string is refused with `HTTP 403 code 5001` ("Official Icedrive mobile client
+  required"), so the mobile one is required, not cosmetic.
+* **No whole-tree listing** - the app's `collection-tree-full` is dead on this API
+  (`code 2003` for every shape tried: routes, params, bodies, app identities and
+  headers), and `/collection` accepts only `cloud`, `trash` and `shared`. Listing is
+  therefore one call per folder.
+* **Deleting is permanent, trashing is not** - `/erase` takes one or many ids and
+  removes them for good, folders refuse to delete at all, and a trashed file keeps
+  its original folder id so `trash-restore` puts it back. `POST /download-multi`,
+  the older batch download route, answers `code 5000 "No files found"` for every id
+  as of 2026-09-24, so `GET /download?id=` is the route that works and the batch one
+  is kept only as a fallback.
 
 ## Capability comparison
 
