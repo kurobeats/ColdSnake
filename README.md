@@ -132,13 +132,41 @@ The proof-of-work is `sha256(challenge_bytes || nonce12 || counter_be32)` needin
 at least `difficultyBits` leading zero bits; `pow_proof` is the base64 of the
 challenge fields plus the winning nonce and hash.
 
+## Capability notes (reviewed against Icedrive's own client)
+
+Icedrive's Linux client is a Qt/WebEngine GUI app; there is no headless build and
+no public API. Its binary was reviewed to work out what a scheduled sync needs:
+
+| capability | source of truth | ColdSnake |
+|---|---|---|
+| proof-of-work login | `pow_proof`, challenge solve | yes |
+| bearer token reuse | app stores `icedrive_stored_cred` | yes - cached 0600, re-login on auth error |
+| device identity | `X-Icedrive-Device-Id`, `X-App-Method: sync` | yes |
+| folder create | `request=folder-create` | yes (creates the remote tree) |
+| listing | `/collection`, `request=collection-tree-full` | yes, recursive per folder |
+| upload | multipart to signed `/deposit` endpoints | yes, streamed with keep-alive |
+| storage quota | `GET /user-stats` (`storage.free`, `bandwidth`) | yes - pre-flight gate + `coldsnake account` |
+| error signalling | API returns HTTP 200 with `{"error": true, "code": ...}` | yes - payloads validated, auth codes re-login |
+| retries/backoff | app retries with "please try again later" | yes - 5xx/429/522 + socket-timeout retries |
+| 2FA | `request=gauthconfirm`, `smsconfirm`, `u2fstart` | **no** - see Limitations |
+| resumable upload | `Content-Range` / `postDataRange()` / "Chunk uploaded" | **no** - a stalled file restarts |
+| download / restore | `/download-multi` | **no** - use the web UI |
+| encrypted folders | `crypto` flag, padding header | **no** - plain uploads only |
+
 ## Limitations
 
 * Unofficial API. Icedrive can change or block it at any time; treat failures as
   loud rather than silent (the exit code and logs are there for that).
+* **2FA is not implemented.** With 2FA enabled on the account, `coldsnake login`
+  cannot complete. The cached token means this only bites when the token is
+  invalidated; otherwise disable 2FA for the account used by scheduled runs.
+* Uploads are not resumable: a stall mid-file restarts that file from zero.
+  Large files on a slow link are the pain case.
 * Folder deletion is not supported by this API (the call reports success and the
   folder stays); delete folders from the web UI.
 * Download is not implemented yet.
+* Only the storage *quota* is enforced; bandwidth limits are reported by
+  `/user-stats` but not acted on.
 
 ## Tests
 
