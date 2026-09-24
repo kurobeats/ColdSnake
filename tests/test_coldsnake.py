@@ -8,8 +8,9 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from coldsnake.client import (AuthError, Client, IcedriveError, check_payload,  # noqa: E402
-                              chunk_ranges, leading_zero_bits, solve_pow, upload_id_for)
+from coldsnake.client import (AuthError, Client, IcedriveError, TransientError,  # noqa: E402
+                              check_payload, chunk_ranges, leading_zero_bits, solve_pow,
+                              upload_id_for)
 from coldsnake.sync import Mirror                                  # noqa: E402
 
 
@@ -90,6 +91,12 @@ class PayloadValidationTests(unittest.TestCase):
     def test_error_payload_raises(self):
         with self.assertRaises(IcedriveError):
             check_payload({"error": True, "code": 2003, "message": "Invalid request"})
+
+    def test_service_unavailable_is_transient(self):
+        for payload in ({"error": True, "code": 503, "message": "Service temporarily unavailable"},
+                        {"error": True, "code": 0, "message": "Fatal error encountered"}):
+            with self.assertRaises(TransientError):
+                check_payload(payload)
 
     def test_auth_error_payload_raises_auth_error(self):
         with self.assertRaises(AuthError):
