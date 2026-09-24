@@ -9,8 +9,9 @@ no third-party binaries, no dependencies beyond the standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs, trash/restore, version history, batch delete).
-85 unit tests.
+verification, idempotent re-runs, trash/restore, version history, batch delete,
+move/rename, download resume).
+131 unit tests.
 
 ## Why this exists
 
@@ -127,6 +128,8 @@ coldsnake download --remote Sync --file docs/report.pdf --version 1 --local /tmp
 coldsnake trash                       # list the remote trash (id, name, size, date)
 coldsnake restore --id 12345          # bring a trashed item back (--id repeatable)
 coldsnake versions --remote Sync --file docs/report.pdf
+coldsnake mv --remote Sync --file docs/report.pdf --to archive          # into an existing folder
+coldsnake rename --remote Sync --file docs/report.pdf --name report-final.pdf
 ```
 
 Global flags: `--verbose` (per-file decisions), `--config PATH`,
@@ -292,6 +295,8 @@ POST <deposit endpoint> multipart {folderId, moddate, unique_upload_id,
 GET  /download?id=<id>                                  -> signed node url for the file
 GET  /version-list?id=<id>                              -> revision list, each with its own url
 POST /erase  {items:file-<id>[,file-<id>…]}             -> delete one file or a batch
+POST /api  {request:move, items:file-<id>[,file-<id>], folderId:<dest>} -> move files into a folder
+POST /api  {request:file-rename, id:<id>, filename:<new>}               -> rename one file
 ```
 
 Details that matter:
@@ -349,7 +354,7 @@ actually needs.
 | 2FA (TOTP / SMS / U2F) | **no** |
 | encrypted folders (IceCrypto) | **no** |
 | two-way sync, live folder watching | **no** |
-| move / rename / file-exchange | **no** |
+| move / rename / file-exchange | yes for move/rename (`coldsnake mv`, `coldsnake rename`, verified live); file-exchange still absent |
 | sharing / public links | **no** |
 
 No whole-tree call exists: `collection-tree-full` was probed across ~68 request
@@ -390,6 +395,16 @@ folder per call and never batches listings.
   The finished length is compared against the size from the listing, so a truncated
   transfer fails instead of landing. There is no per-file hash to compare, so
   same-size corruption still passes.
+* **Move and rename will not overwrite.** `coldsnake mv` into a folder that already
+  holds the same name fails with the API's `5105 Move failed`, and
+  `coldsnake rename --name <existing>` fails with `2005 File exists at destination` -
+  both verified live, both leave the existing file untouched (exit 1, one line
+  naming the file). Moving a file into the folder it is already in is skipped with
+  `already in <dir>` instead of being reported as a failure. Because the API answers
+  success even for an id that no longer exists (verified live), `coldsnake mv`
+  re-lists the destination and fails a file that is not there afterwards rather than
+  claiming a move that did not happen; `Client.move_files` alone can only report how
+  many ids the server accepted.
 * **Folders cannot be deleted** through this API: `/erase` reports success and the
   folder stays. Files can be permanently erased (`--prune-delete`, batch verified
   live) or moved to the trash and brought back with `coldsnake restore --id`
@@ -423,26 +438,28 @@ folder per call and never batches listings.
 
 ## Roadmap
 
-1. **Verify a content hash - blocked on whether the API has one.** Nothing is
-   available to compare against today: the desktop client's upload request sends
-   no hash field (its literal multipart fields are `unique_upload_id`, `files[]`,
-   `X-Icedrive-Padding` and `Content-Range`), and listing entries carry no hash
-   key. So integrity stays length-based. An earlier note here claiming the upload
-   path accepts a `hashAlgorithm` field is **unconfirmed** - settling it needs one
-   live probe (upload with the field, inspect the stored entry), not reverse
-   engineering. Until then hashes would only catch same-size corruption.
-2. Smaller items: confirm listing pagination on very large folders (~1 200 entries
-   per folder is currently proven fine), structured/JSON run summaries for
-   monitoring, PyPI packaging and CI.
+1. **Content hash - closed: the API has none.** Probed live 2026-09-24. The
+   upload accepts `hashAlgorithm`, `hash`, `checksum`, `md5` and `sha256` and
+   ignores every one of them - a deliberately wrong md5 still uploads - and no
+   digest appears anywhere afterwards: listing entries carry 16 keys and no hash,
+   `/version-list`, `/user-stats` and the upload response expose none, and the
+   download `ETag` is nginx `mtime-size`, not content-derived. Integrity therefore
+   stays length-based and no hash check will be added - there is nothing to compare
+   against.
+2. Smaller items: listing pagination is **resolved** - a 301-entry folder came back
+   whole in one `/collection` call with no duplicates, and `limit`, `page`,
+   `offset`, `start`, `perPage`, `count`, `cursor` and `next` are all silently
+   ignored; no cap was found above 301, so the client needs no change. Remaining:
+   structured/JSON run summaries for monitoring, PyPI packaging and CI.
 3. **Missing features the app has and ColdSnake does not** (candidates, not
-   commitments): two-way sync / live folder events, move / rename / file-exchange,
-   sharing and public links, encrypted folders (IceCrypto), 2FA login, and folder
-   delete (the API refuses it - `/erase` no-ops and the folder stays).
+   commitments): two-way sync / live folder events, file-exchange, sharing and
+   public links, encrypted folders (IceCrypto), 2FA login, and folder delete (the
+   API refuses it - `/erase` no-ops and the folder stays).
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 85 tests, no dependencies
+python -m unittest discover -s tests     # 131 tests, no dependencies
 ```
 
 CI (`.github/workflows/tests.yml`) runs exactly that on every push and pull
@@ -470,6 +487,8 @@ tests/test_coldsnake.py   proof-of-work, chunk planning, payload validation,
                           ranged download resume (against a local HTTP server)
 tests/test_client_features.py  trash/restore, versions, batch delete, journal resume
 tests/test_cli_features.py     new subcommands and flags (trash, restore, versions)
+tests/test_move_features.py       client move/rename request shapes (probe-verified)
+tests/test_move_cli_features.py   mv/rename resolution, preflight refusal, failure isolation
 tests/test_sync_features.py    prune trashes by default, --prune-delete erases, guards
 tests/test_state.py            upload-journal load/mark/clear, corrupt-file tolerance
 ```

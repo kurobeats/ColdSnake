@@ -675,4 +675,44 @@ class Client:
             version["index"] = index
         return versions
 
+    # --- move / rename ----------------------------------------------------
+    # Wire formats verified live on 2026-09-24: POST /api {request: "move",
+    # items: "file-<id>[,file-<id>]", folderId: "<destination>"} - the app's
+    # `nitems` field is rejected there (2001 Missing data) and several ids are
+    # comma-joined on `items` - and POST /api {request: "file-rename",
+    # id: "<id>", filename: "<new name>"} where the request name is
+    # `file-rename` (`request=rename` is 2003) and the id field is `id`.
 
+    def move_files(self, file_ids: list[int], folder_id: int) -> int:
+        """Move several files into one folder in a single call; returns how many.
+
+        An empty list is a no-op and issues no call, and a TransientError
+        propagates: an outage must surface as an outage, never as a partial move.
+
+        The API answers success even for an id that no longer exists (verified live),
+        so the returned count is "ids the server accepted", not proof of a move.
+        """
+        file_ids = list(dict.fromkeys(file_ids))     # a repeated id is one file
+        if not file_ids:
+            return 0
+        items = ",".join(f"file-{file_id}" for file_id in file_ids)
+        body, content_type = _urlencode({"request": "move", "items": items,
+                                         "folderId": str(folder_id)})
+        self.call("/api", body, content_type, "POST")
+        return len(file_ids)
+
+    def rename_file(self, file_id: int, filename: str) -> str:
+        """Rename one file; returns the name the server reports.
+
+        An empty or whitespace-only name is refused before any request (it would
+        ask the API to rename a file to nothing); when the response carries no
+        name the requested one is returned.
+        """
+        if not filename.strip():
+            raise IcedriveError(f"refusing to rename file {file_id} to an empty name")
+        body, content_type = _urlencode({"request": "file-rename", "id": str(file_id),
+                                         "filename": filename})
+        result = self.call("/api", body, content_type, "POST")
+        if isinstance(result, dict) and result.get("filename"):
+            return result["filename"]
+        return filename
