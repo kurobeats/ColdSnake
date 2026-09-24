@@ -223,3 +223,6 @@ credentials
 .env
 *.creds
 *.key
+# cached bearer token / device id, in case the CLI ever runs with cwd inside the repo
+token
+device-id
