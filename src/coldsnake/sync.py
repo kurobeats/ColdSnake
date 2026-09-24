@@ -14,7 +14,7 @@ import fnmatch
 import os
 from dataclasses import dataclass, field
 
-from .client import Client
+from .client import AuthError, Client, TransientError
 
 MTIME_TOLERANCE = 2          # seconds; inside this a file counts as unchanged
 
@@ -29,6 +29,8 @@ class Stats:
     unchanged: int = 0
     bytes: int = 0
     verified: int = 0
+    trashed: int = 0
+    deleted: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
 
     def failed(self) -> int:
@@ -74,7 +76,7 @@ class Mirror:
     def __init__(self, client: Client, root: str, remote: str,
                  dry_run: bool = False, verbose: bool = False, log=print, quota_check=None,
                  excludes: list[str] | None = None, prune: bool = False,
-                 prune_force: bool = False):
+                 prune_force: bool = False, prune_delete: bool = False):
         self.client = client
         self.root = root
         self.remote = remote
@@ -85,6 +87,7 @@ class Mirror:
         self.excludes = excludes or []
         self.prune = prune
         self.prune_force = prune_force
+        self.prune_delete = prune_delete
         self.stats = Stats()
         self._folder_ids: dict[str, int] = {}
         self._listings: dict[str, list[dict]] = {}
@@ -175,6 +178,8 @@ class Mirror:
                     self.stats.unchanged += 1
                     continue
                 plan.append((rel, stat, reason))
+            except (TransientError, AuthError):
+                raise                                       # outage/credentials: abort the run
             except Exception as exc:                            # noqa: BLE001 - isolate per file
                 self.stats.failures.append((rel, str(exc)[:200]))
                 self.log(f"  FAILED {rel}: {str(exc)[:200]}")
@@ -201,6 +206,8 @@ class Mirror:
                      "moddate": int(stat.st_mtime), "isFolder": 0})
                 if self.verbose:
                     self.log(f"  uploaded {rel} ({reason}, {stat.st_size} bytes)")
+            except (TransientError, AuthError):
+                raise                                       # outage/credentials: abort the run
             except Exception as exc:                            # noqa: BLE001 - isolate per file
                 self.stats.failures.append((rel, str(exc)[:200]))
                 self.log(f"  FAILED {rel}: {str(exc)[:200]}")
@@ -212,10 +219,11 @@ class Mirror:
         return self.stats
 
     def prune_remote(self) -> None:
-        """Delete remote files that no longer exist locally.
+        """Remove remote files that no longer exist locally.
 
+        Trashes them by default (recoverable); prune_delete erases instead.
         Guards (see README): a complete fresh remote listing is taken first,
-        only files are deleted (the API cannot delete folders), everything stays
+        only files are removed (the API cannot delete folders), everything stays
         inside this mirror's own subtree, and a large wipe must be forced.
         """
         deletions: list[tuple[int, int, str]] = []
@@ -233,27 +241,66 @@ class Mirror:
                 if rel not in self._local_files and not self.excluded(rel):
                     deletions.append((folder_id, entry["id"], rel))
         if not deletions:
-            self.log(f"[{self.remote}] prune: nothing to delete")
+            self.log(f"[{self.remote}] prune: nothing to remove")
             return
         threshold = max(50, remote_total // 4)
         if len(deletions) > threshold and not self.prune_force:
             raise PreflightError(
-                f"prune would delete {len(deletions)} file(s) in {self.remote} "
+                f"prune would remove {len(deletions)} file(s) in {self.remote} "
                 f"(threshold {threshold}); pass --prune-force if this is intended")
-        for folder_id, file_id, rel in deletions:
+        if self.prune_delete:
+            self._erase(deletions)
+        else:
+            for folder_id, file_id, rel in deletions:
+                try:
+                    self.client.trash(file_id)
+                    self.stats.trashed += 1
+                    self.log(f"  trashed {rel}")
+                except (TransientError, AuthError):
+                    raise                                   # outage: report it, do not blame the file
+                except Exception as exc:                    # noqa: BLE001 - isolate per file
+                    self.stats.failures.append((rel, str(exc)[:200]))
+                    self.log(f"  FAILED prune {rel}: {str(exc)[:200]}")
+        self.log(f"[{self.remote}] pruned {len(deletions)} stale file(s) "
+                 f"({self.stats.trashed} trashed, {self.stats.deleted} deleted)")
+
+    def _erase(self, deletions: list[tuple[int, int, str]]) -> None:
+        """Permanently delete pruned files: one batch call, falling back to
+        per-file deletes (with per-file isolation) only if the batch is refused.
+
+        This is the single place prune handles delete failures. On the fallback
+        path an id the batch had already removed is asked for again and its error
+        is counted as a failure - harmless, since /erase does not half-apply in
+        practice, but it does mean stats.deleted can undercount.
+        """
+        file_ids = [file_id for _, file_id, _ in deletions]
+        try:
+            self.stats.deleted += self.client.delete_files(file_ids)
+            for _, _, rel in deletions:
+                self.log(f"  deleted {rel}")
+            return
+        except (TransientError, AuthError):
+            raise                                       # outage/credentials: not a batch problem
+        except Exception as exc:                            # noqa: BLE001 - fall back per file
+            self.log(f"  batch delete failed ({str(exc)[:200]}); retrying per file")
+        for _, file_id, rel in deletions:
             try:
                 self.client.delete_file(file_id)
-                self.log(f"  pruned {rel}")
+                self.stats.deleted += 1
+                self.log(f"  deleted {rel}")
+            except (TransientError, AuthError):
+                raise
             except Exception as exc:                        # noqa: BLE001 - isolate per file
                 self.stats.failures.append((rel, str(exc)[:200]))
                 self.log(f"  FAILED prune {rel}: {str(exc)[:200]}")
-        self.log(f"[{self.remote}] pruned {len(deletions)} stale file(s)")
 
     def verify(self) -> None:
         """Re-list every folder written to and check the sizes we uploaded."""
         for rel_dir, uploaded in self._uploaded.items():
             try:
                 listing = {e["filename"]: e for e in self.client.listing(self.folder_id(rel_dir))}
+            except (TransientError, AuthError):
+                raise                                       # cannot verify while the service is down
             except Exception as exc:                            # noqa: BLE001
                 self.stats.failures.append((rel_dir or "/", f"verify listing failed: {exc}"))
                 continue
