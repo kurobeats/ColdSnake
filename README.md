@@ -42,7 +42,7 @@ Resolved in this order:
 2. `[auth]` section in the config file
 3. `~/.config/icedrive/credentials` (lines `ICEDRIVE_EMAIL=...`, `ICEDRIVE_PASSWORD=...`)
 
-Keep any file holding the password at mode `0600`.
+Keep any file holding the password at mode `0600`. **Never commit credentials** - the repo's `.gitignore` blocks `config.toml`, `credentials`, `.env`, `*.creds` and `*.key` for that reason; copy `config.example.toml` and fill it in outside the repo (e.g. `~/.config/coldsnake/config.toml`).
 
 ## Configure mirrors
 

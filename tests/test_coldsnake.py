@@ -91,6 +91,16 @@ class MirrorTests(unittest.TestCase):
         stats2 = again.run()
         self.assertEqual((stats2.uploaded, stats2.unchanged), (0, 2))
 
+    def test_files_land_inside_the_remote_folder_not_the_drive_root(self):
+        client, _ = self.run_mirror()
+        top = {e["filename"]: e for e in client.tree[0]}
+        self.assertIn("Remote", top, "mirror root folder must be created at the drive root")
+        self.assertNotIn("a.txt", top, "files must not be uploaded loose into the drive root")
+        remote_id = top["Remote"]["id"]
+        self.assertEqual(sorted(e["filename"] for e in client.tree[remote_id]), ["a.txt", "sub"])
+        sub_id = next(e["id"] for e in client.tree[remote_id] if e["isFolder"])
+        self.assertEqual([e["filename"] for e in client.tree[sub_id]], ["b.txt"])
+
     def test_changed_size_is_reuploaded(self):
         client, _ = self.run_mirror()
         with open(os.path.join(self.root, "a.txt"), "w") as handle:
