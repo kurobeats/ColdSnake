@@ -145,11 +145,12 @@ no public API. Its binary was reviewed to work out what a scheduled sync needs:
 | folder create | `request=folder-create` | yes (creates the remote tree) |
 | listing | `/collection`, `request=collection-tree-full` | yes, recursive per folder |
 | upload | multipart to signed `/deposit` endpoints | yes, streamed with keep-alive |
+| **resumable/chunked upload** | `unique_upload_id` + `Content-Range: bytes a-b/total`, replies `"Chunk uploaded"` then `"Upload Successful"` | **yes** - files over `chunk_size` (default 8 MiB) |
 | storage quota | `GET /user-stats` (`storage.free`, `bandwidth`) | yes - pre-flight gate + `coldsnake account` |
 | error signalling | API returns HTTP 200 with `{"error": true, "code": ...}` | yes - payloads validated, auth codes re-login |
 | retries/backoff | app retries with "please try again later" | yes - 5xx/429/522 + socket-timeout retries |
 | 2FA | `request=gauthconfirm`, `smsconfirm`, `u2fstart` | **no** - see Limitations |
-| resumable upload | `Content-Range` / `postDataRange()` / "Chunk uploaded" | **no** - a stalled file restarts |
+
 | download / restore | `/download-multi` | **no** - use the web UI |
 | encrypted folders | `crypto` flag, padding header | **no** - plain uploads only |
 
@@ -160,8 +161,13 @@ no public API. Its binary was reviewed to work out what a scheduled sync needs:
 * **2FA is not implemented.** With 2FA enabled on the account, `coldsnake login`
   cannot complete. The cached token means this only bites when the token is
   invalidated; otherwise disable 2FA for the account used by scheduled runs.
-* Uploads are not resumable: a stall mid-file restarts that file from zero.
-  Large files on a slow link are the pain case.
+* Chunked uploads retry a *range*, not a whole file, so a stall costs at most
+  `chunk_size` of traffic. Measured against the live API: re-sending a range is
+  idempotent (the file does not grow), while resuming a partial upload with a
+  different `unique_upload_id` is rejected - so the id is derived from
+  destination+size+mtime and reused across retries and runs. If a whole run dies
+  mid-file, that file is re-sent from the start (same id, idempotent ranges) and
+  the post-upload size check still guards correctness.
 * Folder deletion is not supported by this API (the call reports success and the
   folder stays); delete folders from the web UI.
 * Download is not implemented yet.

@@ -38,6 +38,11 @@ USER_AGENT = "icedrive-ios/2.3.1"
 CONTROL_TIMEOUT = 60
 UPLOAD_TIMEOUT = 120
 STREAM_CHUNK = 1024 * 1024
+# Files larger than this are uploaded as ranged chunks (verified against the API:
+# chunks are keyed by unique_upload_id, idempotent when re-sent, and a different
+# id cannot resume a partial upload). A stall therefore costs one chunk, not the
+# whole file.
+DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024
 RETRY_STATUS = (429, 500, 502, 503, 504, 522, 524)
 
 
@@ -49,6 +54,10 @@ class AuthError(IcedriveError):
     """Credentials rejected."""
 
 
+class TransientError(IcedriveError):
+    """Server is degraded or throttling: retry slowly, do not hammer."""
+
+
 def now() -> str:
     return time.strftime("%F %T")
 
@@ -56,6 +65,21 @@ def now() -> str:
 # The API reports failures with HTTP 200 and an error payload, so responses must
 # be checked or a failed listing looks like an empty folder.
 AUTH_ERROR_CODES = (1001, 1010, 2001)
+# "code": 0 "Fatal error encountered" is what the API returns when it is degraded
+# or throttling; retry it slowly rather than hammering.
+TRANSIENT_ERROR_CODES = (0,)
+
+
+def chunk_ranges(size: int, chunk: int):
+    """[(offset, length)] covering size in chunk-sized pieces."""
+    return [(offset, min(chunk, size - offset)) for offset in range(0, size, chunk)]
+
+
+def upload_id_for(folder_id: int, path: str, size: int, mtime: int) -> str:
+    """Stable id for a destination+content pair: a retry (even in a later run)
+    continues the same partial upload instead of creating a second one."""
+    seed = f"{folder_id}/{os.path.basename(path)}/{size}/{mtime}"
+    return hashlib.sha1(seed.encode()).hexdigest()
 
 
 def check_payload(data):
@@ -65,6 +89,8 @@ def check_payload(data):
         message = data.get("message") or "unknown error"
         if code in AUTH_ERROR_CODES:
             raise AuthError(f"auth error {code}: {message}")
+        if code in TRANSIENT_ERROR_CODES:
+            raise TransientError(f"API error {code}: {message}")
         raise IcedriveError(f"API error {code}: {message}")
     return data
 
@@ -126,7 +152,8 @@ class Client:
 
     def __init__(self, email: str, password: str, verbose: bool = False,
                  timeout: int = CONTROL_TIMEOUT, upload_timeout: int = UPLOAD_TIMEOUT,
-                 retries: int = 3, device_id: str | None = None, log=print):
+                 retries: int = 3, device_id: str | None = None,
+                 chunk_size: int = DEFAULT_CHUNK_SIZE, log=print):
         self.email = email
         self.password = password
         self.verbose = verbose
@@ -136,6 +163,7 @@ class Client:
         # The official clients identify themselves with a stable device id and an
         # X-App-Method header; matching that seems prudent when the API throttles.
         self.device_id = device_id
+        self.chunk_size = chunk_size
         self.log = log
         self.token: str | None = None
         self.account: dict | None = None
@@ -171,6 +199,10 @@ class Client:
         for attempt in range(self.retries + 1):
             try:
                 return operation()
+            except TransientError as exc:
+                last = exc
+                if attempt < self.retries:
+                    time.sleep(30 * (attempt + 1))          # slow, deliberately
             except AuthError as exc:
                 last = exc
                 if auth:
@@ -325,22 +357,42 @@ class Client:
                 pass
 
     def upload(self, folder_id: int, path: str) -> dict:
-        """Stream one file to a signed /deposit endpoint. Constant memory."""
+        """Upload a file, chunked when it is larger than chunk_size."""
         stat = os.stat(path)
+        if stat.st_size == 0:
+            raise IcedriveError(f"refusing to upload empty file {path}")
+        if self.chunk_size and stat.st_size > self.chunk_size:
+            return self._upload_chunked(folder_id, path, stat)
+        return self._upload_single(folder_id, path, stat)
+
+    def _upload_body(self, folder_id: int, path: str, stat, upload_id=None, size=None,
+                     offset: int = 0):
+        """Build the multipart request for a whole file or one ranged chunk."""
+        size = size if size is not None else stat.st_size
         name = os.path.basename(path).replace("\\", "\\\\").replace('"', '\\"')
         boundary = "----geckoformboundary" + uuid.uuid4().hex
-        preamble = (
-            f'--{boundary}\r\nContent-Disposition: form-data; name="folderId"\r\n\r\n{folder_id}\r\n'
-            f'--{boundary}\r\nContent-Disposition: form-data; name="moddate"\r\n\r\n{int(stat.st_mtime)}\r\n'
-            f'--{boundary}\r\nContent-Disposition: form-data; name="files[]"; filename="{name}"\r\n'
-            f"Content-Type: application/octet-stream\r\n\r\n"
-        ).encode()
+        parts = [
+            f'--{boundary}\r\nContent-Disposition: form-data; name="folderId"\r\n\r\n{folder_id}\r\n',
+            f'--{boundary}\r\nContent-Disposition: form-data; name="moddate"\r\n\r\n{int(stat.st_mtime)}\r\n',
+        ]
+        if upload_id:
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="unique_upload_id"'
+                         f'\r\n\r\n{upload_id}\r\n')
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files[]"; filename="{name}"'
+                     f'\r\nContent-Type: application/octet-stream\r\n\r\n')
+        preamble = "".join(parts).encode()
         trailer = f"\r\n--{boundary}--\r\n".encode()
-        length = len(preamble) + stat.st_size + len(trailer)
-        last = None
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+                   "Accept-Encoding": "identity", "Connection": "keep-alive"}
+        if upload_id:
+            headers["Content-Range"] = f"bytes {offset}-{offset + size - 1}/{stat.st_size}"
+        length = len(preamble) + size + len(trailer)
+        return preamble, trailer, length, headers
 
-        if self.verbose:
-            self.log(f"  uploading {os.path.basename(path)} ({stat.st_size} bytes)")
+    def _send(self, path: str, preamble: bytes, trailer: bytes, length: int, headers: dict,
+              offset: int, size: int):
+        """POST one request, streaming [offset, offset+size) of the file."""
+        last = None
         for attempt in range(self.retries + 1):
             for endpoint in self.upload_endpoints():
                 parsed = urllib.parse.urlsplit(endpoint)
@@ -351,25 +403,31 @@ class Client:
                     conn.putrequest("POST", target)
                     for key, value in self._identity().items():
                         conn.putheader(key, value)
-                    conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+                    for key, value in headers.items():
+                        conn.putheader(key, value)
                     conn.putheader("Content-Length", str(length))
                     conn.endheaders()
                     conn.send(preamble)
                     with open(path, "rb") as handle:
-                        while True:
-                            block = handle.read(STREAM_CHUNK)
+                        handle.seek(offset)
+                        remaining = size
+                        while remaining > 0:
+                            block = handle.read(min(STREAM_CHUNK, remaining))
                             if not block:
                                 break
                             conn.send(block)
+                            remaining -= len(block)
                     conn.send(trailer)
                     response = conn.getresponse()
                     raw = response.read()
                     if response.status >= 400:
                         last = f"HTTP {response.status}"
+                        self._drop_connection(parsed.netloc)
                         continue
                     result = json.loads(raw) if raw.lstrip().startswith(b"{") else {}
                     if result.get("error"):
                         last = json.dumps(result)[:200]
+                        self._drop_connection(parsed.netloc)
                         continue
                     return result
                 except Exception as exc:                        # noqa: BLE001 - try the next mirror
@@ -380,3 +438,26 @@ class Client:
                 time.sleep(2 ** attempt)
                 self._endpoints, self._endpoints_at = [], 0.0
         raise IcedriveError(f"upload failed for {path}: {last}")
+
+    def _upload_single(self, folder_id: int, path: str, stat) -> dict:
+        if self.verbose:
+            self.log(f"  uploading {os.path.basename(path)} ({stat.st_size} bytes)")
+        preamble, trailer, length, headers = self._upload_body(folder_id, path, stat)
+        return self._send(path, preamble, trailer, length, headers, 0, stat.st_size)
+
+    def _upload_chunked(self, folder_id: int, path: str, stat) -> dict:
+        upload_id = upload_id_for(folder_id, path, stat.st_size, int(stat.st_mtime))
+        chunk = self.chunk_size
+        if self.verbose:
+            self.log(f"  uploading {os.path.basename(path)} ({stat.st_size} bytes) in "
+                     f"{-(-stat.st_size // chunk)} chunks, id {upload_id[:8]}")
+        result = {}
+        for offset, size in chunk_ranges(stat.st_size, chunk):
+            preamble, trailer, length, headers = self._upload_body(
+                folder_id, path, stat, upload_id=upload_id, size=size, offset=offset)
+            result = self._send(path, preamble, trailer, length, headers, offset, size)
+        if result.get("message") != "Upload Successful":
+            raise IcedriveError(f"chunked upload did not complete for {path}: {result}")
+        return result
+
+
