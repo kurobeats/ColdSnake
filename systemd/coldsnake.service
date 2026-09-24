@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/env coldsnake mirror
+ExecStart=%h/.local/share/coldsnake/venv/bin/coldsnake mirror
 Nice=10
 IOSchedulingClass=idle
 # The first pass uploads the whole set and Icedrive ingress is ~1.6MB/s per
