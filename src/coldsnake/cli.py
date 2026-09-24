@@ -1,4 +1,4 @@
-"""Command line interface: coldsnake {login,account,ls,trash,restore,versions,check,mirror,download}."""
+"""Command line interface: coldsnake {login,account,ls,trash,restore,versions,check,mirror,download,mv,rename}."""
 from __future__ import annotations
 
 import argparse
@@ -184,19 +184,47 @@ def find_remote_root(client, remote: str) -> int | None:
                  if e.get("filename") == remote and e.get("isFolder")), None)
 
 
-def find_file(client, root_id: int, relpath: str) -> dict | None:
-    """Resolve root_id/relpath to its file entry, or None if any part is missing."""
+def find_entry(client, root_id: int, relpath: str, want: str | None = None) -> dict | None:
+    """Resolve root_id/relpath to its entry, or None if a part is missing.
+
+    want="file"/"folder" disambiguates a name used by both: a path in a command
+    like download or versions has always meant the file, never a same-named folder.
+    """
     folder_id, rel = root_id, relpath
     while True:
         head, sep, rel = rel.partition("/")
-        if not sep:                                       # head is the file name
-            return next((e for e in client.listing(folder_id)
-                         if not e.get("isFolder") and e.get("filename") == head), None)
+        if not sep:                                       # head is the last name
+            entries = [e for e in client.listing(folder_id) if e.get("filename") == head]
+            if want == "file":
+                entries = [e for e in entries if not e.get("isFolder")]
+            elif want == "folder":
+                entries = [e for e in entries if e.get("isFolder")]
+            return entries[0] if entries else None
         sub = next((e["id"] for e in client.listing(folder_id)
                     if e.get("isFolder") and e.get("filename") == head), None)
         if sub is None:
             return None
         folder_id = sub
+
+
+def find_file(client, root_id: int, relpath: str) -> dict | None:
+    """Resolve root_id/relpath to its file entry, or None if any part is missing."""
+    return find_entry(client, root_id, relpath, want="file")
+
+
+def find_target(client, root_id: int, relpath: str, verb: str, where: str) -> dict:
+    """The file relpath names, or a PreflightError saying why there is none.
+
+    A folder sharing the name does not shadow the file (a path in these commands
+    has always meant the file); a folder-only match gets a clearer message than
+    "not found", because that is what the user actually typed.
+    """
+    entry = find_entry(client, root_id, relpath, want="file")
+    if entry is None:
+        if find_entry(client, root_id, relpath, want="folder") is not None:
+            raise PreflightError(f"{relpath!r} is a folder; {verb} works on files")
+        raise PreflightError(f"{relpath!r} not found under {where}")
+    return entry
 
 
 def parse_pairs(config: dict) -> list[tuple[str, str]]:
@@ -272,6 +300,20 @@ def main(argv: list[str] | None = None) -> int:
                     help="relative path under the mirror root (repeatable; default: whole tree)")
     dl.add_argument("--version", type=int, metavar="N",
                     help="download version index N of --file (needs exactly one --file)")
+
+    mv = sub.add_parser("mv", parents=[common], help="move remote files into an existing folder")
+    mv.add_argument("--remote", required=True, help="remote folder name (as in [[mirror]] remote)")
+    mv.add_argument("--file", action="append", default=[], required=True, metavar="RELPATH",
+                    help="relative path under the mirror root (repeatable)")
+    mv.add_argument("--to", default="", metavar="RELDIR",
+                    help="destination folder under the mirror root (default: the root; must exist)")
+
+    rename = sub.add_parser("rename", parents=[common], help="rename a remote file in place")
+    rename.add_argument("--remote", required=True, help="remote folder name (as in [[mirror]] remote)")
+    rename.add_argument("--file", required=True, metavar="RELPATH",
+                        help="relative path under the mirror root")
+    rename.add_argument("--name", required=True, metavar="NEWNAME",
+                        help="new file name (no '/')")
 
     args = parser.parse_args(argv)
     # argparse subparsers overwrite main-parser values with their own defaults,
@@ -425,6 +467,69 @@ def main(argv: list[str] | None = None) -> int:
                     log(f"FAILED {missing}: not found under {args.remote}")
             log(f"done: {len(found)} downloaded, {failures} failure(s)")
             return 1 if failures else 0
+
+        if args.command in ("mv", "rename"):
+            client = build_client(args, config)
+            root = find_remote_root(client, args.remote)
+            if root is None:
+                raise PreflightError(f"remote folder {args.remote!r} not found at the drive root")
+
+            if args.command == "mv":
+                dest_rel = args.to.strip("/")
+                if dest_rel:
+                    dest = find_entry(client, root, dest_rel)
+                    if dest is None or not dest.get("isFolder"):
+                        raise PreflightError(f"destination folder {args.to!r} not found under "
+                                             f"{args.remote} (mv never creates it)")
+                    dest_id = dest["id"]
+                else:
+                    dest_id = root
+                # Resolve every path before moving anything: an unknown --file is a bad
+                # invocation (exit 2), not a per-file failure halfway through the list.
+                targets = []
+                seen: set[int] = set()
+                for relpath in args.file:
+                    entry = find_target(client, root, relpath, "mv", args.remote)
+                    if entry["id"] in seen:     # the same path listed twice: move it once
+                        continue
+                    seen.add(entry["id"])
+                    targets.append((relpath, entry, entry["id"]))
+                failures = 0
+                for relpath, entry, file_id in targets:
+                    name = entry.get("filename") or relpath.rpartition("/")[2]
+                    if int(entry.get("parentId", -1)) == dest_id:
+                        # Moving a file into the folder it is already in: the API refuses
+                        # it (5105), which would look like a failure for a no-op.
+                        log(f"already in {dest_rel or '/'}: {relpath}")
+                        continue
+                    try:
+                        # One call per file (the client batches): that is what isolates a
+                        # single refused file instead of losing the whole batch with it.
+                        client.move_files([file_id], dest_id)
+                        # The API answers HTTP 200 for an id that no longer exists
+                        # (verified live), so a vanished file would be reported as moved.
+                        # Check the destination instead of trusting the response.
+                        if not any(e.get("filename") == name and not e.get("isFolder")
+                                   for e in client.listing(dest_id)):
+                            failures += 1
+                            log(f"FAILED move {relpath}: not in the destination afterwards")
+                            continue
+                        log(f"moved {relpath} -> {dest_rel or '/'}")
+                    except (TransientError, AuthError):
+                        raise                               # outage/credentials: not one file's fault
+                    except Exception as exc:                        # noqa: BLE001 - keep moving the rest
+                        failures += 1
+                        log(f"FAILED move {relpath}: {str(exc)[:200]}")
+                return 1 if failures else 0
+
+            if "/" in args.name:
+                raise PreflightError(f"--name {args.name!r} is a path; rename takes a file name")
+            if not args.name.strip():
+                raise PreflightError("rename needs a non-empty --name")
+            entry = find_target(client, root, args.file, "rename", args.remote)
+            new_name = client.rename_file(entry["id"], args.name)
+            log(f"renamed {args.file} -> {new_name}")
+            return 0
 
         # mirror
         pairs = resolve_pairs(args, config)
