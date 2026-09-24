@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldsnake"
+version = "0.1.0"
+description = "Icedrive client: proof-of-work login, folder listing, upload-only mirroring (no WebDAV)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+keywords = ["icedrive", "backup", "mirror", "cloud-storage"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Archiving :: Backup",
+]
+dependencies = []
+
+[project.scripts]
+coldsnake = "coldsnake.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/antcoz/ColdSnake"
+
+[tool.setuptools.packages.find]
+where = ["src"]

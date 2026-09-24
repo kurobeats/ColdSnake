@@ -1,0 +1,12 @@
+# Run as the invoking user (systemd user unit) or override User= for system-wide.
+[Unit]
+Description=ColdSnake - upload-only Icedrive mirror
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+EnvironmentFile=-/home/%i/.config/coldsnake/credentials
+ExecStart=/usr/bin/env coldsnake mirror
+TimeoutStartSec=infinity

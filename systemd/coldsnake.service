@@ -1,0 +1,14 @@
+[Unit]
+Description=ColdSnake - upload-only Icedrive mirror
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env coldsnake mirror
+Nice=10
+IOSchedulingClass=idle
+# The first pass uploads the whole set and Icedrive ingress is ~1.6MB/s per
+# account, so a full run can take hours. It is incremental: every run only
+# uploads what differs, so nightly runs continue where the last one stopped.
+TimeoutStartSec=infinity
