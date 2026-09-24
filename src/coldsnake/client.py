@@ -292,9 +292,10 @@ class Client:
         """Cache the bearer token plus the account info the login returned, so a
         scheduled run rarely needs to log in (login is the 2FA-protected step)."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as handle:
+        # create with 0600 directly: never a world-readable window
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
             json.dump({"token": self.token, "account": self.account}, handle)
-        os.chmod(path, 0o600)
 
     def load_token(self, path: str, validate=None) -> bool:
         """validate: callable that raises if the token is not usable (defaults to
