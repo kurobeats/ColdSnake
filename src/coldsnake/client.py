@@ -489,4 +489,57 @@ class Client:
             raise IcedriveError(f"chunked upload did not complete for {path}: {result}")
         return result
 
+    # --- download / delete ------------------------------------------------
+    # Wire formats verified against the live account (round-trip with sha256
+    # match) on 2026-09-24: POST /download-multi {items: file-<id>, crypto: 0}
+    # -> {urls: [{url}]} (url may be relative to https://apis.icedrive.net), and
+    # POST /erase {items: file-<id>} deletes a file. Folder erase silently
+    # does nothing, so only files are ever passed to /erase.
+
+    def download_url(self, file_id: int) -> str:
+        """Signed URL for one file, from the batch endpoint the desktop app uses."""
+        body, content_type = _urlencode({"items": f"file-{file_id}", "crypto": "0"})
+        result = self.call("/download-multi", body, content_type, "POST")
+        urls = (result or {}).get("urls") or []
+        if not urls or not urls[0].get("url"):
+            raise IcedriveError(f"no download url for file {file_id}: {json.dumps(result)[:200]}")
+        url = urls[0]["url"]
+        return url if url.startswith("https://") else "https://apis.icedrive.net" + url
+
+    def download(self, file_id: int, dest: str) -> int:
+        """Stream one file to dest (via .tmp + rename). Returns bytes written.
+        ponytail: no Range resume - a retry restarts the file. The official
+        client chunks downloads; add resume if long-haul failures hurt."""
+        last = None
+        for attempt in range(self.retries + 1):
+            tmp = dest + ".tmp"
+            try:
+                request = urllib.request.Request(self.download_url(file_id), method="GET")
+                for key, value in self._identity().items():
+                    if key != "Authorization":            # the URL itself carries the signature
+                        request.add_header(key, value)
+                with urllib.request.urlopen(request, context=self._context, timeout=self.timeout) as response:
+                    with open(tmp, "wb") as handle:
+                        while True:
+                            block = response.read(STREAM_CHUNK)
+                            if not block:
+                                break
+                            handle.write(block)
+                os.replace(tmp, dest)
+                return os.stat(dest).st_size
+            except urllib.error.HTTPError as exc:
+                last = exc
+                if exc.code not in RETRY_STATUS:
+                    raise IcedriveError(f"download failed for {dest}: HTTP {exc.code}") from exc
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+                last = exc
+            if attempt < self.retries:
+                time.sleep(2 ** attempt)
+        raise IcedriveError(f"download failed for {dest}: {last}")
+
+    def delete_file(self, file_id: int) -> None:
+        """Delete one remote file. Folders cannot be deleted through this API."""
+        body, content_type = _urlencode({"items": f"file-{file_id}"})
+        self.call("/erase", body, content_type, "POST")
+
 

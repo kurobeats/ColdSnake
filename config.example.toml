@@ -15,3 +15,7 @@ remote = "Sync"
 [[mirror]]
 local = "/srv/data/Pictures"
 remote = "Pictures"
+
+# Optional: skip files/dirs matching these globs (same as --exclude, repeatable
+# globs in a list). Matched against the relative path and the file name.
+exclude = ["*.tmp", ".stfolder/*", ".stversions/*"]

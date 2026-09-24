@@ -8,7 +8,7 @@ no third-party binaries, no dependencies beyond the standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs). 21 unit tests.
+verification, idempotent re-runs). 28 unit tests.
 
 ## Why this exists
 
@@ -115,6 +115,9 @@ coldsnake mirror --dry-run            # report what would upload, change nothing
 coldsnake mirror                      # every [[mirror]] in the config
 coldsnake mirror --local /srv/data/music --remote music
 coldsnake mirror --allow-empty        # tolerate an empty source directory
+coldsnake mirror --exclude '*.tmp' --exclude '.stfolder/*' --prune
+coldsnake download --remote Sync --local /tmp/restore          # whole tree
+coldsnake download --remote Sync --file docs/report.pdf --local /tmp/restore
 ```
 
 Global flags: `--verbose` (per-file decisions), `--config PATH`,
@@ -258,15 +261,15 @@ actually needs.
 | streamed uploads, keep-alive | yes |
 | chunked / resumable uploads | yes - stable id, idempotent range retries |
 | post-upload verification | yes (sizes; hashes not available without download) |
+| download / restore | yes - `coldsnake download`, signed `/download-multi` URLs (verified live) |
 | storage quota check | yes - pre-flight gate + `coldsnake account` |
 | retries, backoff, per-file isolation | yes |
-| download / restore | **no** |
+| prune local deletions | yes - opt-in `--prune`, guarded, files only |
+| exclusions / ignore patterns | yes - `--exclude` globs + `exclude` list in config |
 | 2FA (TOTP / SMS / U2F) | **no** |
 | encrypted folders (IceCrypto) | **no** |
 | two-way sync, live folder watching | **no** |
 | move / rename / trash restore | **no** |
-| prune local deletions | **no** (additive only) |
-| exclusions / ignore patterns | **no** |
 
 ## Limitations
 
@@ -275,44 +278,42 @@ actually needs.
 * **2FA is not implemented.** With 2FA enabled, `coldsnake login` cannot complete.
   The cached token means this only bites when the token is invalidated; otherwise
   use an account without 2FA for scheduled runs.
-* **No download/restore.** `/download-multi` answers `5000: No files found` for
-  every addressing form tried, `/download` rejects the obvious parameters. Restores
-  currently mean the web UI or the desktop app. This is the weakest link for a
-  backup tool and is on the roadmap.
+* **Download has no resume.** `coldsnake download` fetches a signed URL from
+  `/download-multi` (verified live with a sha256 round-trip) and streams the file.
+  A retry restarts the whole file; ranged/chunked download is on the roadmap.
 * **Folders cannot be deleted** through this API: `/erase` reports success and the
-  folder stays. Files delete fine. Empty remote directories linger.
+  folder stays. Files delete fine (verified live), which is what `--prune` uses.
+  Empty remote directories linger.
 * **Quota numbers are unreliable.** On the account tested, `/user-stats` reports
   0 bytes used after 290 MB of uploads, so the storage gate is a safety net rather
   than a meter.
 * **Cross-run resume restarts a file.** In-run retries resume a chunk; if the whole
   run dies mid-file, that file is re-sent from the start (same id, idempotent
   ranges, size still verified).
-* **Additive only.** Stale remote files must be removed by hand until pruning lands.
-* **No exclusions.** Everything under a source directory is mirrored, including
-  `.stversions`, `.stfolder` and cache directories.
+* **Additive unless `--prune`.** By default a file removed locally stays remote.
+  With `--prune`, remote files with no local counterpart are deleted - files only,
+  never folders, never outside the mirror's own subtree, and only after a complete
+  fresh remote listing. A wipe above a sanity threshold (50 files or a quarter of
+  the mirror, whichever is larger) must be confirmed with `--prune-force`. Files
+  matching your `--exclude` globs are never pruned.
 * Single account, single config, no profiles. Proxy support is untested (urllib
   honours `http_proxy`/`https_proxy`).
 
 ## Roadmap
 
-1. **Prune local deletions** - opt-in `--prune`, with guards: never prune when a
-   source is missing/empty, abort if deletions exceed a sanity threshold unless
-   forced, only inside the destination subtree, and only after a complete remote
-   listing. Files only; folders cannot be deleted.
-2. **Download/restore** - including ranged download for large files, which also
-   unlocks content-hash verification.
-3. **Exclusions** - `--exclude` globs, and an include/exclude config section.
-4. **Hash integrity** - the upload path accepts a `hashAlgorithm` field; sending and
+1. **Download resume** - ranged download for large files (the official client
+   chunks its downloads), which also unlocks content-hash verification.
+2. **Hash integrity** - the upload path accepts a `hashAlgorithm` field; sending and
    comparing hashes would catch same-size corruption that the size check misses.
-5. Smaller items: confirm listing pagination on very large folders (~1 200 entries
-   per folder is currently proven fine), consider `request=collection-tree-full`
-   for cheaper full-tree listing, structured/JSON run summaries for monitoring,
-   PyPI packaging and CI.
+3. Smaller items: `collection-tree-full` for cheaper full-tree listing (present in
+   the official client's protocol), confirm listing pagination on very large folders
+   (~1 200 entries per folder is currently proven fine), structured/JSON run
+   summaries for monitoring, PyPI packaging and CI.
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 21 tests, no dependencies
+python -m unittest discover -s tests     # 28 tests, no dependencies
 ```
 
 Layout:

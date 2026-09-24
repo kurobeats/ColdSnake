@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ class FakeClient:
     def __init__(self):
         self.tree = {0: []}
         self.uploads = []
+        self.deleted = []
         self._next = 1
 
     def listing(self, folder_id=0):
@@ -43,6 +45,22 @@ class FakeClient:
         self.tree[folder_id].append({"filename": name, "filesize": stat.st_size,
                                      "moddate": int(stat.st_mtime), "isFolder": 0})
         return {"error": False}
+
+    def download_url(self, file_id):
+        return f"fake://file-{file_id}"
+
+    def download(self, file_id, dest):
+        # fake payload keyed by id: lets tests assert content round-trips
+        data = f"payload-{file_id}".encode()
+        with open(dest + ".tmp", "wb") as handle:
+            handle.write(data)
+        os.replace(dest + ".tmp", dest)
+        return len(data)
+
+    def delete_file(self, file_id):
+        self.deleted.append(file_id)
+        for fid, entries in self.tree.items():
+            self.tree[fid] = [e for e in entries if e.get("id") != file_id]
 
 
 class ProofOfWorkTests(unittest.TestCase):
@@ -220,6 +238,57 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(client.uploads, [])
         self.assertEqual(client.tree[0], [])
 
+    def test_excludes_skip_upload(self):
+        with open(os.path.join(self.root, "skip.tmp"), "w") as handle:
+            handle.write("junk")
+        with open(os.path.join(self.root, "sub", "skip.log"), "w") as handle:
+            handle.write("junk")
+        client = FakeClient()
+        Mirror(client, self.root, "Remote", log=lambda *_: None,
+               excludes=["*.tmp", "*.log"]).run()
+        self.assertEqual(sorted(client.uploads), ["a.txt", "b.txt"])
+
+    def test_prune_deletes_remote_only_files(self):
+        client, _ = self.run_mirror()
+        remote_id = next(e["id"] for e in client.tree[0] if e["filename"] == "Remote")
+        client.tree[remote_id].append({"id": 999, "filename": "gone.txt",
+                                       "filesize": 1, "moddate": 0, "isFolder": 0})
+        stats = Mirror(client, self.root, "Remote", log=lambda *_: None, prune=True).run()
+        self.assertEqual(client.deleted, [999])
+        self.assertEqual(stats.failed(), 0)
+
+    def test_prune_aborts_above_threshold_without_force(self):
+        client, _ = self.run_mirror()
+        remote_id = next(e["id"] for e in client.tree[0] if e["filename"] == "Remote")
+        for i in range(60):                       # 2 remote files + 60 stale > threshold 50
+            client.tree[remote_id].append({"id": 1000 + i, "filename": f"stale{i}",
+                                           "filesize": 1, "moddate": 0, "isFolder": 0})
+        with self.assertRaises(PreflightError):
+            Mirror(client, self.root, "Remote", log=lambda *_: None, prune=True).run()
+        self.assertEqual(client.deleted, [])
+        Mirror(client, self.root, "Remote", log=lambda *_: None,
+               prune=True, prune_force=True).run()
+        self.assertEqual(len(client.deleted), 60)
+
+    def test_prune_keeps_excluded_files(self):
+        client, _ = self.run_mirror()
+        remote_id = next(e["id"] for e in client.tree[0] if e["filename"] == "Remote")
+        client.tree[remote_id].append({"id": 777, "filename": "cache.tmp",
+                                       "filesize": 1, "moddate": 0, "isFolder": 0})
+        Mirror(client, self.root, "Remote", log=lambda *_: None,
+               prune=True, excludes=["*.tmp"]).run()
+        self.assertEqual(client.deleted, [], "never-uploaded excluded files must not be pruned")
+
+    def test_download_roundtrip(self):
+        client, _ = self.run_mirror()
+        remote_id = next(e["id"] for e in client.tree[0] if e["filename"] == "Remote")
+        entry = client.tree[remote_id][0]
+        dest = os.path.join(self.root, "out.bin")
+        size = client.download(entry["id"], dest)
+        with open(dest, "rb") as handle:
+            self.assertEqual(handle.read(), f"payload-{entry['id']}".encode())
+        self.assertEqual(size, len(f"payload-{entry['id']}"))
+
 
 class QuotaGateTests(unittest.TestCase):
     def setUp(self):
@@ -267,6 +336,37 @@ class QuotaGateTests(unittest.TestCase):
         self.assertTrue(same.load_token(path, validate=lambda: None))
         self.assertEqual(same.token, "tok123")
         self.assertEqual(same.account["plan"], "Pro")
+
+
+class CliExitCodeTests(unittest.TestCase):
+    """README promises exit 2 for 'refused to start: bad config' - hold it to that."""
+
+    def test_bad_toml_exits_2(self):
+        from coldsnake.cli import main
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+            handle.write("[auth\nbroken =")
+            path = handle.name
+        try:
+            self.assertEqual(main(["--config", path, "account"]), 2)
+        finally:
+            os.unlink(path)
+
+    def test_missing_credentials_exits_2(self):
+        from coldsnake.cli import main
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+            handle.write("[auth]\nemail = 'x'\n")
+            path = handle.name
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ICEDRIVE_")}
+        home = tempfile.mkdtemp()                      # no legacy ~/.config/icedrive/credentials
+        env["HOME"] = env["USERPROFILE"] = home
+        try:
+            code = subprocess.run(
+                [sys.executable, "-m", "coldsnake.cli", "--config", path, "account"],
+                env=env, capture_output=True, cwd=os.path.join(os.path.dirname(__file__), "..", "src"))
+            self.assertEqual(code.returncode, 2)
+        finally:
+            os.unlink(path)
+            os.rmdir(home)
 
 
 if __name__ == "__main__":
