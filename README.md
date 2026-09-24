@@ -8,7 +8,7 @@ no third-party binaries, no dependencies beyond the standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs). 37 unit tests.
+verification, idempotent re-runs). 38 unit tests.
 
 ## Why this exists
 
@@ -374,7 +374,7 @@ actually needs.
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 37 tests, no dependencies
+python -m unittest discover -s tests     # 38 tests, no dependencies
 ```
 
 Layout:
