@@ -8,7 +8,7 @@ no third-party binaries, no dependencies beyond the standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs). 33 unit tests.
+verification, idempotent re-runs). 37 unit tests.
 
 ## Why this exists
 
@@ -300,7 +300,7 @@ actually needs.
 | streamed uploads, keep-alive | yes |
 | chunked / resumable uploads | yes - stable id, idempotent range retries |
 | post-upload verification | yes - sizes, uploads and downloads (no hash exists to compare) |
-| download / restore | yes - `coldsnake download`, signed `/download-multi` URLs (verified live), resumable via `Range` |
+| download / restore | yes - `coldsnake download`, `GET /download?id=` CDN URL (verified live), resumable via `Range` |
 | storage quota check | yes - pre-flight gate + `coldsnake account` |
 | retries, backoff, per-file isolation | yes |
 | prune local deletions | yes - opt-in `--prune`, guarded, files only |
@@ -325,13 +325,17 @@ actually needs.
   The cached token means this only bites when the token is invalidated; otherwise
   use an account without 2FA for scheduled runs.
 * **Download is resumed and size-checked, not hash-checked.** `coldsnake download`
-  fetches a signed URL from `/download-multi` (verified live with a sha256
-  round-trip) and streams it. The signed URL honours `Range` (the same trick
-  go-icedrive uses), so a retry continues the partial `.tmp` instead of
-  restarting a multi-GB file, and a server that ignores the range is detected and
-  restarted rather than appended to. The finished length is compared against the
-  size from the listing, so a truncated transfer fails instead of landing. There
-  is no per-file hash to compare, so same-size corruption still passes.
+  asks `GET /download?id=<id>`, which returns a signed
+  `https://<node>.icedrive.io/download?p=...` URL (verified live 2026-09-24), and
+  streams it. The older batch route `/download-multi` stopped working the same day
+  - it answers `{"code": 5000, "message": "No files found"}` for every file id,
+  including one uploaded seconds earlier - so ColdSnake keeps it only as a
+  fallback. The signed URL honours `Range` (the same trick go-icedrive uses), so a
+  retry continues the partial `.tmp` instead of restarting a multi-GB file, and a
+  server that ignores the range is detected and restarted rather than appended to.
+  The finished length is compared against the size from the listing, so a truncated
+  transfer fails instead of landing. There is no per-file hash to compare, so
+  same-size corruption still passes.
 * **Folders cannot be deleted** through this API: `/erase` reports success and the
   folder stays. Files delete fine (verified live), which is what `--prune` uses.
   Empty remote directories linger.
@@ -370,7 +374,7 @@ actually needs.
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 33 tests, no dependencies
+python -m unittest discover -s tests     # 37 tests, no dependencies
 ```
 
 Layout:

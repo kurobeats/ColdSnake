@@ -492,19 +492,35 @@ class Client:
 
     # --- download / delete ------------------------------------------------
     # Wire formats verified against the live account (round-trip with sha256
-    # match) on 2026-09-24: POST /download-multi {items: file-<id>, crypto: 0}
-    # -> {urls: [{url}]} (url may be relative to https://apis.icedrive.net), and
-    # POST /erase {items: file-<id>} deletes a file. Folder erase silently
-    # does nothing, so only files are ever passed to /erase.
+    # match) on 2026-09-24: GET /download?id=<id> -> {url: "https://<node>.
+    # icedrive.io/download?p=..."} (the route the desktop client calls "DL
+    # request", and the only one that still works), and POST /erase
+    # {items: file-<id>} deletes a file. Folder erase silently does nothing, so
+    # only files are ever passed to /erase.
 
     def download_url(self, file_id: int) -> str:
-        """Signed URL for one file, from the batch endpoint the desktop app uses."""
-        body, content_type = _urlencode({"items": f"file-{file_id}", "crypto": "0"})
-        result = self.call("/download-multi", body, content_type, "POST")
-        urls = (result or {}).get("urls") or []
-        if not urls or not urls[0].get("url"):
-            raise IcedriveError(f"no download url for file {file_id}: {json.dumps(result)[:200]}")
-        url = urls[0]["url"]
+        """Signed CDN URL for one file.
+
+        GET /download?id=<id> is the desktop client's route and the one the
+        account serves today. /download-multi, the older batch route, now answers
+        {"code": 5000, "message": "No files found"} for every file id - even one
+        uploaded seconds earlier - so it is kept only as a fallback.
+        """
+        result = None
+        try:
+            result = self.call(f"/download?id={file_id}")
+        except TransientError:
+            raise                                         # service down: not a route problem
+        except IcedriveError as exc:
+            if self.verbose:
+                self.log(f"  /download?id={file_id} failed ({exc}); trying /download-multi")
+        url = (result or {}).get("url")
+        if not url:
+            body, content_type = _urlencode({"items": f"file-{file_id}", "crypto": "0"})
+            urls = (self.call("/download-multi", body, content_type, "POST") or {}).get("urls") or []
+            url = urls[0].get("url") if urls else None
+        if not url:
+            raise IcedriveError(f"no download url for file {file_id}")
         return url if url.startswith("https://") else "https://apis.icedrive.net" + url
 
     def download(self, file_id: int, dest: str, size: int | None = None) -> int:

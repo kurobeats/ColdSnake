@@ -373,6 +373,48 @@ class CliExitCodeTests(unittest.TestCase):
             os.rmdir(home)
 
 
+class DownloadUrlTests(unittest.TestCase):
+    """The single-file endpoint is the one that works; /download-multi is a fallback."""
+
+    class Recorder(Client):
+        def __init__(self, answers):
+            super().__init__("a@b.c", "pw", log=lambda *_: None)
+            self.answers = answers
+            self.calls = []
+
+        def call(self, path, body=None, content_type=None, method="GET", auth=True):
+            self.calls.append((path, method))
+            answer = self.answers[path]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    def test_prefers_download_by_id(self):
+        url = "https://ice-us-10853888.icedrive.io/download?p=token"
+        client = self.Recorder({"/download?id=42": {"error": False, "url": url}})
+        self.assertEqual(client.download_url(42), url)
+        self.assertEqual(client.calls, [("/download?id=42", "GET")])
+
+    def test_falls_back_to_download_multi(self):
+        client = self.Recorder({
+            "/download?id=42": IcedriveError("API error 5000: No files found"),
+            "/download-multi": {"error": False, "urls": [{"url": "/signed/file"}]},
+        })
+        self.assertEqual(client.download_url(42), "https://apis.icedrive.net/signed/file")
+        self.assertEqual([path for path, _ in client.calls], ["/download?id=42", "/download-multi"])
+
+    def test_no_url_at_all_is_an_error(self):
+        client = self.Recorder({"/download?id=42": {"error": False},
+                                "/download-multi": {"error": False, "urls": []}})
+        with self.assertRaises(IcedriveError):
+            client.download_url(42)
+
+    def test_service_outage_is_not_swallowed_by_the_fallback(self):
+        client = self.Recorder({"/download?id=42": TransientError("Service temporarily unavailable")})
+        with self.assertRaises(TransientError):
+            client.download_url(42)
+
+
 class DownloadResumeTests(unittest.TestCase):
     """Signed URLs honour Range, so a retry must continue the partial .tmp.
 
