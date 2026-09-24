@@ -42,7 +42,7 @@ class Mirror:
         self.verbose = verbose
         self.log = log
         self.stats = Stats()
-        self._folder_ids: dict[str, int] = {"": 0}
+        self._folder_ids: dict[str, int] = {}
         self._listings: dict[str, list[dict]] = {}
         self._uploaded: dict[str, list[tuple[str, int]]] = {}
 
@@ -54,11 +54,14 @@ class Mirror:
         return self._listings[rel]
 
     def folder_id(self, rel: str) -> int:
+        """Remote folder id for a local relative dir. '' is the mirror root
+        (a folder named after the remote name, created at the drive root)."""
         if rel in self._folder_ids:
             return self._folder_ids[rel]
-        parent_rel = os.path.dirname(rel)
-        parent_id = self.folder_id(parent_rel)
-        name = os.path.basename(rel)
+        if rel == "":
+            parent_id, name = 0, self.remote
+        else:
+            parent_id, name = self.folder_id(os.path.dirname(rel)), os.path.basename(rel)
         parent_entries = [] if parent_id < 0 else self.client.listing(parent_id)
         existing = next((e for e in parent_entries
                          if e.get("filename") == name and e.get("isFolder")), None)
@@ -66,10 +69,11 @@ class Mirror:
             self._folder_ids[rel] = existing["id"]
             return existing["id"]
         if self.dry_run:
-            self.log(f"  would create remote folder {self.remote}/{rel}")
+            self.log(f"  would create remote folder {name if rel == '' else self.remote + '/' + rel}")
             self._folder_ids[rel] = -1
             return -1
         self._folder_ids[rel] = self.client.ensure_folder(parent_id, name)
+        parent_rel = os.path.dirname(rel)
         self._listings.pop(parent_rel, None)
         return self._folder_ids[rel]
 

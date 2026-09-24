@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- secrets: never commit ---------------------------------------------
+config.toml
+credentials
+.env
+*.creds
+*.key

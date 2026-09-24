@@ -1,0 +1,17 @@
+# Copy to ~/.config/coldsnake/config.toml and adjust. Do NOT commit a filled-in
+# copy: it contains your mirrors and possibly your password.
+
+# Prefer the ICEDRIVE_EMAIL / ICEDRIVE_PASSWORD environment variables, or a
+# 0600 credentials file, over putting the password here.
+[auth]
+email = "you@example.com"
+# password = ""
+
+# One [[mirror]] block per local directory you want mirrored.
+[[mirror]]
+local = "/srv/data/Sync"
+remote = "Sync"
+
+[[mirror]]
+local = "/srv/data/Pictures"
+remote = "Pictures"
