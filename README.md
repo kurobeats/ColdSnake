@@ -8,7 +8,8 @@ no third-party binaries, no dependencies beyond the standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs). 38 unit tests.
+verification, idempotent re-runs, trash/restore, version history, batch delete).
+85 unit tests.
 
 ## Why this exists
 
@@ -75,12 +76,13 @@ Whichever you use, keep the file at mode `0600`. **Never commit credentials** - 
 repo's `.gitignore` blocks `config.toml`, `credentials`, `.env`, `*.creds` and
 `*.key` for that reason. Copy `config.example.toml` and fill it in *outside* the repo.
 
-Two more files live under `~/.config/coldsnake/` and are safe to delete:
+Three more files live under `~/.config/coldsnake/` and are safe to delete:
 
 | file | purpose |
 |---|---|
 | `token` (0600) | cached bearer token + account info, so runs rarely need to log in |
 | `device-id` | stable client id, sent as `X-Icedrive-Device-Id` |
+| `upload-journal.json` | chunks already sent, so a killed run resumes (safe to delete) |
 
 ## Configure mirrors
 
@@ -116,8 +118,14 @@ coldsnake mirror                      # every [[mirror]] in the config
 coldsnake mirror --local /srv/data/music --remote music
 coldsnake mirror --allow-empty        # tolerate an empty source directory
 coldsnake mirror --exclude '*.tmp' --exclude '.stfolder/*' --prune
+coldsnake mirror --prune-delete       # prune permanently instead of trashing
+coldsnake mirror --no-upload-journal  # do not resume partial uploads next run
 coldsnake download --remote Sync --local /tmp/restore          # whole tree
 coldsnake download --remote Sync --file docs/report.pdf --local /tmp/restore
+coldsnake download --remote Sync --file docs/report.pdf --version 1 --local /tmp/old
+coldsnake trash                       # list the remote trash (id, name, size, date)
+coldsnake restore --id 12345          # bring a trashed item back (--id repeatable)
+coldsnake versions --remote Sync --file docs/report.pdf
 ```
 
 Global flags: `--verbose` (per-file decisions), `--config PATH`,
@@ -131,7 +139,7 @@ sub-command.
 | 0 | success |
 | 1 | ran, but some files failed |
 | 2 | refused to start: bad config, missing/unreadable/empty source, auth failure |
-| 3 | service unavailable - nothing was attempted, retry later |
+| 3 | service unavailable - the run stopped (nothing attempted, or it aborted part-way), retry later |
 
 That makes it safe to drop into cron, systemd, or a CI job.
 
@@ -144,7 +152,7 @@ A long run is never started on a whim:
    under a second with exit 3 instead of spending hours on failed uploads.
 2. **Sources** - missing, unreadable or **empty** source directories are refused
    (`--allow-empty` overrides). An empty source means the mirror would do nothing -
-   or, once pruning exists, delete things.
+   or, with `--prune`, trash everything.
 3. **Config** - the same local path listed twice is refused.
 4. **Storage** - free space is checked against the bytes actually pending, once the
    plan is known (see the quota caveat).
@@ -157,8 +165,9 @@ probe.
 * **Incremental.** Uploads only when size or mtime differ (mtime tolerance 2 s).
   Icedrive preserves the upload-time mtime, so a second run is nearly free: a
   2 583-file tree re-checks in ~56 s and uploads nothing.
-* **Additive.** No deletes are ever issued unless `--prune` is passed. A file
-  removed locally stays remote by default.
+* **Additive.** No remote item is removed unless `--prune` is passed - and then it
+  is trashed (recoverable) unless `--prune-delete` is set. A file removed locally
+  stays remote by default.
 * **Chunked and resumable.** Files larger than `chunk_size` (8 MiB by default) are
   uploaded as ranged chunks: a stall costs one chunk, not a 4 GB file.
 * **Streams.** File bodies are streamed through one request with a known
@@ -296,19 +305,29 @@ actually needs.
 | proof-of-work login | yes |
 | bearer token reuse | yes - cached 0600, re-login on auth error |
 | device identity | yes |
-| recursive listing, folder creation | yes |
+| recursive listing, folder creation | yes - one call per folder (see below) |
+| whole-tree listing | **no** - no `collection-tree-full`; listing stays one call per folder |
 | streamed uploads, keep-alive | yes |
 | chunked / resumable uploads | yes - stable id, idempotent range retries |
+| cross-run upload resume | yes - chunk offsets journalled, so a killed run resumes (see `upload-journal.json`) |
 | post-upload verification | yes - sizes, uploads and downloads (no hash exists to compare) |
-| download / restore | yes - `coldsnake download`, `GET /download?id=` CDN URL (verified live), resumable via `Range` |
+| download | yes - `coldsnake download`, `GET /download?id=` signed node url (verified live), resumable via `Range` |
+| version history download | yes - `coldsnake versions`, `download --version N` via the version's own url |
+| trash / restore | yes - `coldsnake trash`, `coldsnake restore --id` (verified live) |
+| batch delete | yes - one `POST /erase` with comma-joined ids (verified live) |
 | storage quota check | yes - pre-flight gate + `coldsnake account` |
 | retries, backoff, per-file isolation | yes |
-| prune local deletions | yes - opt-in `--prune`, guarded, files only |
+| prune local deletions | yes - opt-in `--prune` trashes by default, `--prune-delete` erases, files only |
 | exclusions / ignore patterns | yes - `--exclude` globs + `exclude` list in config |
 | 2FA (TOTP / SMS / U2F) | **no** |
 | encrypted folders (IceCrypto) | **no** |
 | two-way sync, live folder watching | **no** |
-| move / rename / trash restore | **no** |
+| move / rename / file-exchange | **no** |
+| sharing / public links | **no** |
+
+No whole-tree call exists: `collection-tree-full` was probed across ~68 request
+shapes and every one answers `code 2003 Invalid request`, so ColdSnake lists one
+folder per call and never batches listings.
 
 ## Limitations
 
@@ -324,33 +343,54 @@ actually needs.
 * **2FA is not implemented.** With 2FA enabled, `coldsnake login` cannot complete.
   The cached token means this only bites when the token is invalidated; otherwise
   use an account without 2FA for scheduled runs.
+* **The mobile User-Agent is load-bearing.** A desktop `User-Agent` gets
+  `HTTP 403` with `code 5001` ("Official Icedrive mobile client required"), so
+  `icedrive-ios/2.3.1` plus `X-App-Method: sync` is what the API demands. It must
+  not be "fixed" to a browser or desktop string.
 * **Download is resumed and size-checked, not hash-checked.** `coldsnake download`
   asks `GET /download?id=<id>`, which returns a signed
   `https://<node>.icedrive.io/download?p=...` URL (verified live 2026-09-24), and
   streams it. The older batch route `/download-multi` stopped working the same day
   - it answers `{"code": 5000, "message": "No files found"}` for every file id,
   including one uploaded seconds earlier - so ColdSnake keeps it only as a
-  fallback. The signed URL honours `Range` (the same trick go-icedrive uses), so a
-  retry continues the partial `.tmp` instead of restarting a multi-GB file, and a
-  server that ignores the range is detected and restarted rather than appended to.
+  fallback. Version history is fetched the same way: `coldsnake versions` reads
+  `GET /version-list?id=<id>`, and `download --version N` streams that version's own
+  pre-signed `url`, because a `&version=` parameter on `/download` is ignored and
+  always serves the current bytes. The signed URL honours `Range` (the same trick
+  go-icedrive uses), so a retry continues the partial `.tmp` instead of restarting
+  a multi-GB file, and a server that ignores the range is detected and restarted
+  rather than appended to.
   The finished length is compared against the size from the listing, so a truncated
   transfer fails instead of landing. There is no per-file hash to compare, so
   same-size corruption still passes.
 * **Folders cannot be deleted** through this API: `/erase` reports success and the
-  folder stays. Files delete fine (verified live), which is what `--prune` uses.
-  Empty remote directories linger.
+  folder stays. Files can be permanently erased (`--prune-delete`, batch verified
+  live) or moved to the trash and brought back with `coldsnake restore --id`
+  (verified live). Because no folder can be deleted, empty remote directories
+  linger, and the `folder-<id>` trash/restore prefixes are untested (a probe folder
+  could not be cleaned up).
 * **Quota numbers are unreliable.** On the account tested, `/user-stats` reports
   0 bytes used after 290 MB of uploads, so the storage gate is a safety net rather
   than a meter.
-* **Cross-run resume restarts a file.** In-run retries resume a chunk; if the whole
-  run dies mid-file, that file is re-sent from the start (same id, idempotent
-  ranges, size still verified).
+* **Cross-run resume** covers chunked uploads: `~/.config/coldsnake/upload-journal.json`
+  records which chunk offsets landed, so a run killed mid-file re-sends only the
+  missing chunks for the same upload id. `--no-upload-journal` disables it and the
+  file can be deleted at any time. Files not larger than one chunk (streamed whole,
+  ≤ 8 MiB by default) are still re-sent from the start. If every chunk was
+  journalled but the run died before the journal was cleared, the folder is re-listed
+  and the journal is believed only when the server's size agrees - otherwise the
+  journal is dropped and the file is sent again next run. Journal entries for
+  abandoned uploads are never garbage collected (they are tiny, and a changed file
+  gets a new id anyway).
 * **Additive unless `--prune`.** By default a file removed locally stays remote.
-  With `--prune`, remote files with no local counterpart are deleted - files only,
-  never folders, never outside the mirror's own subtree, and only after a complete
-  fresh remote listing. A wipe above a sanity threshold (50 files or a quarter of
-  the mirror, whichever is larger) must be confirmed with `--prune-force`. Files
-  matching your `--exclude` globs are never pruned.
+  With `--prune`, remote files with no local counterpart are **moved to the trash** -
+  recoverable, files only, never folders, never outside the mirror's own subtree,
+  and only after a complete fresh remote listing. `--prune-delete` erases them
+  permanently instead (one batched `POST /erase`, per-file fallback). A wipe above
+  a sanity threshold (50 files or a quarter of the mirror, whichever is larger)
+  must be confirmed with `--prune-force`. Files matching your `--exclude` globs are
+  never pruned. Trashed files are listed by `coldsnake trash` and brought back with
+  `coldsnake restore --id <id>`.
 * Single account, single config, no profiles. Proxy support is untested (urllib
   honours `http_proxy`/`https_proxy`).
 
@@ -364,28 +404,35 @@ actually needs.
    path accepts a `hashAlgorithm` field is **unconfirmed** - settling it needs one
    live probe (upload with the field, inspect the stored entry), not reverse
    engineering. Until then hashes would only catch same-size corruption.
-2. **Collection-tree-full** for a cheaper full-tree listing (present in the
-   official client's protocol), which would also make `download` and `--prune`
-   single-request instead of one listing per folder.
-3. Smaller items: confirm listing pagination on very large folders (~1 200 entries
+2. Smaller items: confirm listing pagination on very large folders (~1 200 entries
    per folder is currently proven fine), structured/JSON run summaries for
    monitoring, PyPI packaging and CI.
+3. **Missing features the app has and ColdSnake does not** (candidates, not
+   commitments): two-way sync / live folder events, move / rename / file-exchange,
+   sharing and public links, encrypted folders (IceCrypto), 2FA login, and folder
+   delete (the API refuses it - `/erase` no-ops and the folder stays).
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 38 tests, no dependencies
+python -m unittest discover -s tests     # 85 tests, no dependencies
 ```
 
 Layout:
 
 ```
-src/coldsnake/client.py   API client: PoW login, listing, folders, chunked uploads
-src/coldsnake/sync.py     mirror logic, pre-flight checks, verification
+src/coldsnake/client.py   API client: PoW login, listing, folders, chunked uploads,
+                          trash/restore, versions, download, batch delete
+src/coldsnake/sync.py     mirror logic, pre-flight checks, verification, prune
+src/coldsnake/state.py    cross-run upload journal (which chunk offsets landed)
 src/coldsnake/cli.py      argument parsing, config, credentials/token/device-id
 tests/test_coldsnake.py   proof-of-work, chunk planning, payload validation,
                           pre-flight, mirror behaviour (against an in-memory client),
                           ranged download resume (against a local HTTP server)
+tests/test_client_features.py  trash/restore, versions, batch delete, journal resume
+tests/test_cli_features.py     new subcommands and flags (trash, restore, versions)
+tests/test_sync_features.py    prune trashes by default, --prune-delete erases, guards
+tests/test_state.py            upload-journal load/mark/clear, corrupt-file tolerance
 ```
 
 Tests must pass before a change lands. The mirror tests use an in-memory fake, so

@@ -26,6 +26,7 @@ class FakeClient:
         self.tree = {0: []}
         self.uploads = []
         self.deleted = []
+        self.trashed = []
         self._next = 1
 
     def listing(self, folder_id=0):
@@ -63,6 +64,11 @@ class FakeClient:
 
     def delete_file(self, file_id):
         self.deleted.append(file_id)
+        for fid, entries in self.tree.items():
+            self.tree[fid] = [e for e in entries if e.get("id") != file_id]
+
+    def trash(self, file_id):
+        self.trashed.append(file_id)
         for fid, entries in self.tree.items():
             self.tree[fid] = [e for e in entries if e.get("id") != file_id]
 
@@ -252,13 +258,14 @@ class MirrorTests(unittest.TestCase):
                excludes=["*.tmp", "*.log"]).run()
         self.assertEqual(sorted(client.uploads), ["a.txt", "b.txt"])
 
-    def test_prune_deletes_remote_only_files(self):
+    def test_prune_trashes_remote_only_files(self):
         client, _ = self.run_mirror()
         remote_id = next(e["id"] for e in client.tree[0] if e["filename"] == "Remote")
         client.tree[remote_id].append({"id": 999, "filename": "gone.txt",
                                        "filesize": 1, "moddate": 0, "isFolder": 0})
         stats = Mirror(client, self.root, "Remote", log=lambda *_: None, prune=True).run()
-        self.assertEqual(client.deleted, [999])
+        self.assertEqual(client.trashed, [999])
+        self.assertEqual(client.deleted, [])
         self.assertEqual(stats.failed(), 0)
 
     def test_prune_aborts_above_threshold_without_force(self):
@@ -269,10 +276,12 @@ class MirrorTests(unittest.TestCase):
                                            "filesize": 1, "moddate": 0, "isFolder": 0})
         with self.assertRaises(PreflightError):
             Mirror(client, self.root, "Remote", log=lambda *_: None, prune=True).run()
+        self.assertEqual(client.trashed, [])
         self.assertEqual(client.deleted, [])
         Mirror(client, self.root, "Remote", log=lambda *_: None,
                prune=True, prune_force=True).run()
-        self.assertEqual(len(client.deleted), 60)
+        self.assertEqual(len(client.trashed), 60)
+        self.assertEqual(client.deleted, [])
 
     def test_prune_keeps_excluded_files(self):
         client, _ = self.run_mirror()

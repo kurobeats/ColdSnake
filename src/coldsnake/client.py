@@ -155,7 +155,8 @@ class Client:
     def __init__(self, email: str, password: str, verbose: bool = False,
                  timeout: int = CONTROL_TIMEOUT, upload_timeout: int = UPLOAD_TIMEOUT,
                  retries: int = 3, device_id: str | None = None,
-                 chunk_size: int = DEFAULT_CHUNK_SIZE, log=print):
+                 chunk_size: int = DEFAULT_CHUNK_SIZE, log=print,
+                 journal: "UploadJournal | None" = None):
         self.email = email
         self.password = password
         self.verbose = verbose
@@ -167,6 +168,9 @@ class Client:
         self.device_id = device_id
         self.chunk_size = chunk_size
         self.log = log
+        # Optional cross-run resume journal. None (the default), empty, or one
+        # holding a different upload id must behave exactly like no journal.
+        self.journal = journal
         self.token: str | None = None
         self.account: dict | None = None
         self._context = ssl.create_default_context()
@@ -481,13 +485,35 @@ class Client:
         if self.verbose:
             self.log(f"  uploading {os.path.basename(path)} ({stat.st_size} bytes) in "
                      f"{-(-stat.st_size // chunk)} chunks, id {upload_id[:8]}")
-        result = {}
+        # Offsets a previous run already landed are skipped: each chunk is
+        # megabytes, so not re-sending them is the whole point of the journal.
+        done = self.journal.done(upload_id) if self.journal else set()
+        result = None
         for offset, size in chunk_ranges(stat.st_size, chunk):
+            if offset in done:
+                continue
             preamble, trailer, length, headers = self._upload_body(
                 folder_id, path, stat, upload_id=upload_id, size=size, offset=offset)
             result = self._send(path, preamble, trailer, length, headers, offset, size)
+            if self.journal:
+                self.journal.mark(upload_id, offset)
+        if result is None:
+            # Every chunk was journalled by a run that died before it could clear:
+            # believe that only if the server's listing agrees on the size, else
+            # drop the journal so the next attempt re-sends the whole file.
+            entry = next((e for e in self.listing(folder_id)
+                          if e.get("filename") == os.path.basename(path)), None)
+            if entry is None or int(entry.get("filesize", -1)) != stat.st_size:
+                if self.journal:
+                    self.journal.clear(upload_id)
+                raise IcedriveError(
+                    f"journalled upload for {path} is not complete on the server; "
+                    f"cleared the journal, re-run to send it")
+            result = {"message": "Upload Successful"}
         if result.get("message") != "Upload Successful":
             raise IcedriveError(f"chunked upload did not complete for {path}: {result}")
+        if self.journal:
+            self.journal.clear(upload_id)
         return result
 
     # --- download / delete ------------------------------------------------
@@ -524,13 +550,19 @@ class Client:
         return url if url.startswith("https://") else "https://apis.icedrive.net" + url
 
     def download(self, file_id: int, dest: str, size: int | None = None) -> int:
-        """Stream one file to dest (via .tmp + rename). Returns bytes written.
+        """Stream one file to dest (via .tmp + rename). Returns bytes written."""
+        return self.download_from_url(self.download_url(file_id), dest, size)
+
+    def download_from_url(self, url: str, dest: str, size: int | None = None) -> int:
+        """Stream a signed download url to dest (via .tmp + rename); returns bytes.
 
         Resumes: the signed URL honours Range (verified against the live account
         and go-icedrive's range HEAD), so a retry continues the partial .tmp
         instead of restarting a multi-GB file. The finished length is checked
         against the known size - the API exposes no per-file hash, so length is
-        the only integrity signal it can give.
+        the only integrity signal it can give. Separate from download() so a
+        version's own pre-signed url (the only way to fetch an old version) can
+        be streamed with the same engine.
         """
         tmp = dest + ".tmp"
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
@@ -541,7 +573,7 @@ class Client:
                 os.replace(tmp, dest)
                 return size
             try:
-                request = urllib.request.Request(self.download_url(file_id), method="GET")
+                request = urllib.request.Request(url, method="GET")
                 for key, value in self._identity().items():
                     if key != "Authorization":            # the URL itself carries the signature
                         request.add_header(key, value)
@@ -587,5 +619,60 @@ class Client:
         """Delete one remote file. Folders cannot be deleted through this API."""
         body, content_type = _urlencode({"items": f"file-{file_id}"})
         self.call("/erase", body, content_type, "POST")
+
+    def delete_files(self, file_ids: list[int]) -> int:
+        """Permanently delete several files in one call; returns how many.
+
+        POST /erase with a comma-joined `items` list is verified to remove them
+        all at once (single files still work). There is deliberately no per-file
+        fallback here: the caller (Mirror._erase) owns failure isolation, so a
+        partly deleted batch cannot be re-erased by a second layer. A
+        TransientError propagates, because an outage must surface as an outage.
+        """
+        file_ids = list(file_ids)
+        if not file_ids:
+            return 0
+        items = ",".join(f"file-{file_id}" for file_id in file_ids)
+        body, content_type = _urlencode({"items": items})
+        self.call("/erase", body, content_type, "POST")
+        return len(file_ids)
+
+    # --- trash / versions -------------------------------------------------
+    # Wire formats verified live on 2026-09-24: POST /api {request: "trash-add"
+    # |"trash-restore", items: "file-<id>"} (the restore request name is
+    # `trash-restore`, NOT `restore-trash`), GET /collection?type=trash&
+    # folderId=0 for the trash listing, and GET /version-list?id=<id> whose
+    # per-version `url` is the only way to fetch an old version (a &version=
+    # param on /download is ignored).
+
+    def trash(self, item_id: int, is_folder: bool = False) -> None:
+        """Move one item to the trash. Folder ids are passed through but
+        folder trash is untested; only file-<id> is verified."""
+        body, content_type = _urlencode({"request": "trash-add",
+                                         "items": f"{'folder' if is_folder else 'file'}-{item_id}"})
+        self.call("/api", body, content_type, "POST")
+
+    def restore(self, item_id: int, is_folder: bool = False) -> None:
+        """Restore one trashed item. Request name is `trash-restore` (verified),
+        item field is `items` with a file-/folder- prefix."""
+        body, content_type = _urlencode({"request": "trash-restore",
+                                         "items": f"{'folder' if is_folder else 'file'}-{item_id}"})
+        self.call("/api", body, content_type, "POST")
+
+    def trash_listing(self) -> list[dict]:
+        """Trashed items: same entry shape as a folder listing."""
+        return self.call("/collection?type=trash&folderId=0").get("data", [])
+
+    def versions(self, file_id: int) -> list[dict]:
+        """Version history for one file, newest first.
+
+        The API keys versions by unix timestamp and hands each a pre-signed url;
+        `index` is the position in the server's list, which is what the CLI's
+        `download --version N` selects on.
+        """
+        versions = self.call(f"/version-list?id={file_id}").get("versions") or []
+        for index, version in enumerate(versions):
+            version["index"] = index
+        return versions
 
 

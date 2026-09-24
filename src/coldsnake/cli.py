@@ -1,9 +1,10 @@
-"""Command line interface: coldsnake {login,ls,mirror}."""
+"""Command line interface: coldsnake {login,account,ls,trash,restore,versions,check,mirror,download}."""
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import time
 import tomllib
 
 from . import __version__
@@ -73,11 +74,11 @@ def resolve_credentials(config: dict) -> tuple[str, str]:
     return email, password
 
 
-def build_client(args, config, use_cache: bool = True) -> Client:
+def build_client(args, config, use_cache: bool = True, journal=None) -> Client:
     """Cached bearer token when possible, otherwise proof-of-work login."""
     email, password = resolve_credentials(config)
     client = Client(email, password, verbose=args.verbose,
-                    device_id=resolve_device_id(config), log=log)
+                    device_id=resolve_device_id(config), log=log, journal=journal)
     if use_cache and not getattr(args, "no_token_cache", False):
         client._token_path = TOKEN_CACHE
         if client.load_token(TOKEN_CACHE):
@@ -97,6 +98,39 @@ def resolve_pairs(args, config: dict) -> list[tuple[str, str]]:
         raise PreflightError(
             f"no mirrors: pass --local/--remote or add [[mirror]] entries to {args.config}")
     return pairs
+
+
+def format_date(entry: dict) -> str:
+    """Listing/version entries carry a preformatted date, else a unix moddate."""
+    date = entry.get("date")
+    if date:
+        return str(date)
+    stamp = entry.get("moddate") or entry.get("timestamp")
+    try:
+        return time.strftime("%F %T", time.localtime(int(stamp))) if stamp else "-"
+    except (TypeError, ValueError, OverflowError, OSError):  # not our data: print it
+        return str(stamp)
+
+
+def find_remote_root(client, remote: str) -> int | None:
+    """Id of the mirror root folder at the drive root, or None."""
+    return next((e["id"] for e in client.listing(0)
+                 if e.get("filename") == remote and e.get("isFolder")), None)
+
+
+def find_file(client, root_id: int, relpath: str) -> dict | None:
+    """Resolve root_id/relpath to its file entry, or None if any part is missing."""
+    folder_id, rel = root_id, relpath
+    while True:
+        head, sep, rel = rel.partition("/")
+        if not sep:                                       # head is the file name
+            return next((e for e in client.listing(folder_id)
+                         if not e.get("isFolder") and e.get("filename") == head), None)
+        sub = next((e["id"] for e in client.listing(folder_id)
+                    if e.get("isFolder") and e.get("filename") == head), None)
+        if sub is None:
+            return None
+        folder_id = sub
 
 
 def parse_pairs(config: dict) -> list[tuple[str, str]]:
@@ -126,6 +160,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("account", parents=[common], help="show plan, storage quota and bandwidth usage")
     sub.add_parser("ls", parents=[common], help="list a remote folder").add_argument(
         "--folder-id", type=int, default=0)
+    sub.add_parser("trash", parents=[common], help="list trashed items (id, name, size, date)")
+    restore = sub.add_parser("restore", parents=[common], help="restore trashed items by id")
+    restore.add_argument("--id", type=int, action="append", default=[], required=True,
+                         metavar="ID", help="trashed item id (repeatable)")
+    restore.add_argument("--folder", action="store_true", help="the ids are folder ids")
+    versions = sub.add_parser("versions", parents=[common], help="list a file's version history")
+    versions.add_argument("--remote", required=True,
+                          help="remote folder name (as in [[mirror]] remote)")
+    versions.add_argument("--file", required=True, metavar="RELPATH",
+                          help="relative path under the mirror root")
     check = sub.add_parser("check", parents=[common],
                            help="pre-flight only: service health + mirror sources (no uploads)")
     check.add_argument("--local", help="local directory to check (with --remote)")
@@ -144,12 +188,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="delete remote files that no longer exist locally")
     mirror.add_argument("--prune-force", action="store_true",
                         help="allow prune to exceed the sanity threshold")
+    mirror.add_argument("--prune-delete", action="store_true",
+                        help="permanently delete pruned files instead of trashing them")
+    mirror.add_argument("--no-upload-journal", action="store_true",
+                        help="do not resume a partial upload from a previous run")
 
     dl = sub.add_parser("download", parents=[common], help="download from Icedrive to a local directory")
     dl.add_argument("--remote", required=True, help="remote folder name (as in [[mirror]] remote)")
     dl.add_argument("--local", required=True, help="destination directory")
     dl.add_argument("--file", action="append", default=[], metavar="RELPATH",
                     help="relative path under the mirror root (repeatable; default: whole tree)")
+    dl.add_argument("--version", type=int, metavar="N",
+                    help="download version index N of --file (needs exactly one --file)")
 
     args = parser.parse_args(argv)
     # argparse subparsers overwrite main-parser values with their own defaults,
@@ -200,17 +250,68 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{kind}{size}  {entry['filename']}")
             return 0
 
+        if args.command == "trash":
+            client = build_client(args, config)
+            for entry in client.trash_listing():
+                size = "" if entry.get("isFolder") else str(int(entry.get("filesize") or 0))
+                print(f"{entry.get('id'):>10}  {format_date(entry):<19}  {size:>12}  {entry['filename']}")
+            return 0
+
+        if args.command == "restore":
+            client = build_client(args, config)
+            failures = 0
+            for item_id in args.id:
+                try:
+                    client.restore(item_id, is_folder=args.folder)
+                    log(f"restored {item_id}")
+                except (TransientError, AuthError):
+                    raise                                   # outage/credentials: not one item's fault
+                except Exception as exc:                        # noqa: BLE001 - keep restoring the rest
+                    failures += 1
+                    log(f"FAILED restore {item_id}: {str(exc)[:200]}")
+            return 1 if failures else 0
+
+        if args.command == "versions":
+            client = build_client(args, config)
+            root = find_remote_root(client, args.remote)
+            if root is None:
+                raise PreflightError(f"remote folder {args.remote!r} not found at the drive root")
+            entry = find_file(client, root, args.file)
+            if entry is None:
+                raise PreflightError(f"{args.file!r} not found under {args.remote}")
+            for version in client.versions(entry["id"]):
+                current = "current" if version.get("current") else ""
+                print(f"{version.get('index'):>4}  {format_date(version):<19}  "
+                      f"{int(version.get('filesize') or 0):>12}  {current}")
+            return 0
+
         if args.command == "download":
             if not args.remote:
                 raise PreflightError("download needs --remote (the mirror root folder name)")
             if not args.file and not os.path.isdir(os.path.expanduser(args.local)):
                 raise PreflightError(f"destination does not exist: {args.local}")
             client = build_client(args, config)
-            root = next((e["id"] for e in client.listing(0)
-                         if e.get("filename") == args.remote and e.get("isFolder")), None)
+            root = find_remote_root(client, args.remote)
             if root is None:
                 raise PreflightError(f"remote folder {args.remote!r} not found at the drive root")
             dest_root = os.path.expanduser(args.local)
+
+            if args.version is not None:
+                if len(args.file) != 1:
+                    raise PreflightError("--version needs exactly one --file")
+                entry = find_file(client, root, args.file[0])
+                if entry is None:
+                    raise PreflightError(f"{args.file[0]!r} not found under {args.remote}")
+                chosen = next((v for v in client.versions(entry["id"])
+                               if v.get("index") == args.version), None)
+                if chosen is None:                             # absent index: a failure, not a crash
+                    log(f"FAILED {args.file[0]}: no version {args.version}")
+                    return 1
+                size = client.download_from_url(chosen["url"], os.path.join(dest_root, args.file[0]),
+                                                size=int(chosen.get("filesize") or 0) or None)
+                log(f"downloaded {args.file[0]} version {args.version} ({size} bytes)")
+                return 0
+
             wanted = set(args.file)
             failures = 0
 
@@ -245,7 +346,11 @@ def main(argv: list[str] | None = None) -> int:
 
         # mirror
         pairs = resolve_pairs(args, config)
-        client = build_client(args, config)
+        journal = None
+        if not args.no_upload_journal:
+            from .state import UploadJournal               # lazy: the CLI must not need state to import
+            journal = UploadJournal(os.path.join(os.path.dirname(DEFAULT_CONFIG), "upload-journal.json"))
+        client = build_client(args, config, journal=journal)
         excludes = list(args.exclude) + list(config.get("exclude", []))
 
         # Nothing long runs until the service answers and the sources are sane.
@@ -267,15 +372,21 @@ def main(argv: list[str] | None = None) -> int:
         for local, remote in pairs:
             mirrorer = Mirror(client, local, remote, dry_run=args.dry_run, verbose=args.verbose,
                               log=log, quota_check=quota_check, excludes=excludes,
-                              prune=args.prune, prune_force=args.prune_force)
+                              prune=args.prune, prune_force=args.prune_force,
+                              prune_delete=args.prune_delete)
             try:
                 stats = mirrorer.run()
+            except (TransientError, AuthError):
+                # A run that aborted on an outage must exit 3 (2 for credentials),
+                # not be counted as file failures the way a bad file is.
+                raise
             except Exception as exc:                            # noqa: BLE001 - one dir must not stop the rest
                 log(f"{remote}: ABORTED: {str(exc)[:200]}")
                 failures += 1
                 continue
             log(f"{remote}: uploaded {stats.uploaded} ({stats.bytes / 1e6:.1f} MB), "
-                  f"unchanged {stats.unchanged}, verified {stats.verified}, failed {stats.failed()}")
+                  f"unchanged {stats.unchanged}, verified {stats.verified}, "
+                  f"trashed {stats.trashed}, deleted {stats.deleted}, failed {stats.failed()}")
             failures += stats.failed()
         log(f"done: {failures} failure(s)")
         return 1 if failures else 0
@@ -284,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"authentication failed: {exc}")
         return 2
     except TransientError as exc:
-        log(f"service unavailable, nothing attempted: {exc}")
+        log(f"service unavailable, run aborted: {exc}")
         return 3
     except PreflightError as exc:
         log(f"pre-flight refused to start: {exc}")
