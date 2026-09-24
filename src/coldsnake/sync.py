@@ -18,6 +18,10 @@ from .client import Client
 MTIME_TOLERANCE = 2          # seconds; inside this a file counts as unchanged
 
 
+class PreflightError(RuntimeError):
+    """The run must not start (bad config, missing source, nothing to mirror)."""
+
+
 @dataclass
 class Stats:
     uploaded: int = 0
@@ -28,6 +32,39 @@ class Stats:
 
     def failed(self) -> int:
         return len(self.failures)
+
+
+def preflight(client, pairs, allow_empty: bool = False):
+    """Check everything that would make a long run pointless before starting it.
+
+    * service health - a degraded API is what made a 25h run look like a mystery
+      earlier; failing here costs seconds instead of hours of failed uploads
+    * sources - a missing, unreadable or empty local directory means the mirror is
+      about to do nothing (or, once pruning exists, delete things). Refuse.
+    * config sanity - the same local path mirrored twice is a mistake.
+    """
+    stats = client.probe()                      # TransientError/AuthError propagate
+    storage = stats.get("storage", {})
+
+    seen = {}
+    for local, remote in pairs:
+        if not local or not remote:
+            raise PreflightError("mirror needs both a local path and a remote name")
+        resolved = os.path.realpath(os.path.expanduser(local))
+        if resolved in seen:
+            raise PreflightError(f"{local} is mirrored twice (also as {seen[resolved]!r})")
+        seen[resolved] = remote
+        if not os.path.exists(resolved):
+            raise PreflightError(f"source does not exist: {local}")
+        if not os.path.isdir(resolved):
+            raise PreflightError(f"source is not a directory: {local}")
+        if not os.access(resolved, os.R_OK | os.X_OK):
+            raise PreflightError(f"source is not readable: {local}")
+        if not os.listdir(resolved) and not allow_empty:
+            raise PreflightError(
+                f"source is empty: {local} (refusing to mirror nothing; "
+                f"pass --allow-empty if this is intended)")
+    return {"storage": storage}
 
 
 class Mirror:

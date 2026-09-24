@@ -7,8 +7,8 @@ import sys
 import tomllib
 
 from . import __version__
-from .client import AuthError, Client, IcedriveError
-from .sync import Mirror
+from .client import AuthError, Client, IcedriveError, TransientError
+from .sync import Mirror, PreflightError, preflight
 
 def log(message: str) -> None:
     """Unbuffered logging: under systemd/journald a block-buffered stdout hides
@@ -83,6 +83,18 @@ def build_client(args, config, use_cache: bool = True) -> Client:
     return client
 
 
+def resolve_pairs(args, config: dict) -> list[tuple[str, str]]:
+    """Pairs from --local/--remote, else from the config's [[mirror]] entries."""
+    if getattr(args, "local", None):
+        if not args.remote:
+            sys.exit("--local requires --remote")
+        return [(args.local, args.remote)]
+    pairs = parse_pairs(config)
+    if not pairs:
+        sys.exit(f"no mirrors: pass --local/--remote or add [[mirror]] entries to {args.config}")
+    return pairs
+
+
 def parse_pairs(config: dict) -> list[tuple[str, str]]:
     """Return (local, remote) pairs from config [[mirror]] entries."""
     pairs = []
@@ -107,11 +119,18 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("account", parents=[common], help="show plan, storage quota and bandwidth usage")
     sub.add_parser("ls", parents=[common], help="list a remote folder").add_argument(
         "--folder-id", type=int, default=0)
+    check = sub.add_parser("check", parents=[common],
+                           help="pre-flight only: service health + mirror sources (no uploads)")
+    check.add_argument("--local", help="local directory to check (with --remote)")
+    check.add_argument("--remote", help="remote folder name (with --local)")
+    check.add_argument("--allow-empty", action="store_true", help="tolerate empty sources")
 
     mirror = sub.add_parser("mirror", parents=[common], help="upload-only mirror local dirs into Icedrive")
     mirror.add_argument("--local", help="local directory (with --remote)")
     mirror.add_argument("--remote", help="remote folder name (with --local)")
     mirror.add_argument("--dry-run", action="store_true", help="report what would upload, change nothing")
+    mirror.add_argument("--allow-empty", action="store_true",
+                        help="do not refuse when a source directory is empty")
     parser.add_argument("--no-token-cache", action="store_true", help="always log in (ignore the cached token)")
 
     args = parser.parse_args(argv)
@@ -134,6 +153,21 @@ def main(argv: list[str] | None = None) -> int:
             log(f"bandwidth: {bandwidth.get('used_human')} of {bandwidth.get('max_human')} used")
             return 0
 
+        if args.command == "check":
+            pairs = resolve_pairs(args, config)
+            client = build_client(args, config)
+            info = preflight(client, pairs, allow_empty=args.allow_empty)
+            storage = info["storage"]
+            user = client.account or {}
+            log(f"service : ok ({user.get('email')}, plan {user.get('plan')})")
+            log(f"storage : {storage.get('used_human')} of {storage.get('max_human')} used, "
+                f"{storage.get('free_human')} free")
+            for local, remote in pairs:
+                entries = len(os.listdir(os.path.expanduser(local)))
+                log(f"source  : {local} -> {remote} ({entries} entries)")
+            log("pre-flight ok")
+            return 0
+
         if args.command == "ls":
             client = build_client(args, config)
             for entry in client.listing(args.folder_id):
@@ -143,16 +177,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         # mirror
-        if args.local:
-            if not args.remote:
-                sys.exit("--local requires --remote")
-            pairs = [(args.local, args.remote)]
-        else:
-            pairs = parse_pairs(config)
-            if not pairs:
-                sys.exit(f"no mirrors: pass --local/--remote or add [[mirror]] entries to {args.config}")
-
+        pairs = resolve_pairs(args, config)
         client = build_client(args, config)
+
+        # Nothing long runs until the service answers and the sources are sane.
+        info = preflight(client, pairs, allow_empty=args.allow_empty)
+        storage = info["storage"]
+        log(f"pre-flight ok: service up, {storage.get('free_human')} free on the account")
 
         def quota_check(needed: int) -> None:
             storage = client.user_stats().get("storage", {})
@@ -181,10 +212,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if failures else 0
 
     except AuthError as exc:
-        print(f"authentication failed: {exc}")
+        log(f"authentication failed: {exc}")
+        return 2
+    except TransientError as exc:
+        log(f"service unavailable, nothing attempted: {exc}")
+        return 3
+    except PreflightError as exc:
+        log(f"pre-flight refused to start: {exc}")
         return 2
     except IcedriveError as exc:
-        print(f"error: {exc}")
+        log(f"error: {exc}")
         return 1
     except KeyboardInterrupt:
         print("interrupted")

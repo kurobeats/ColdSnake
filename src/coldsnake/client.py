@@ -196,13 +196,19 @@ class Client:
         return check_payload(json.loads(raw)) if raw.lstrip().startswith(b"{") else raw
 
     def _retry(self, operation, auth: bool):
-        """Run operation, retrying 5xx/429/network errors; re-login once on 401/403."""
+        """Run operation, retrying 5xx/429/network errors; re-login once on 401/403.
+
+        If the last failure was a retryable one the error is reported as
+        TransientError, so callers can tell "Icedrive is down" (retry later, exit 3)
+        from "your request is wrong" (exit 1).
+        """
         last = None
+        transient = False
         for attempt in range(self.retries + 1):
             try:
                 return operation()
             except TransientError as exc:
-                last = exc
+                last, transient = exc, True
                 if attempt < self.retries:
                     time.sleep(30 * (attempt + 1))          # slow, deliberately
             except AuthError as exc:
@@ -214,6 +220,7 @@ class Client:
                 raise
             except urllib.error.HTTPError as exc:
                 last = f"HTTP {exc.code} {exc.reason}"
+                transient = exc.code in RETRY_STATUS
                 if exc.code in (401, 403) and auth:
                     self.log(f"[{now()}] auth error {exc.code}; logging in again")
                     self.login()
@@ -221,10 +228,11 @@ class Client:
                 if exc.code not in RETRY_STATUS:
                     raise
             except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
-                last = exc
+                last, transient = exc, True
             if attempt < self.retries:
                 time.sleep(2 ** attempt)
-        raise IcedriveError(f"request failed after {self.retries + 1} attempts: {last}")
+        message = f"request failed after {self.retries + 1} attempts: {last}"
+        raise TransientError(message) if transient else IcedriveError(message)
 
     def call(self, path, body=None, content_type=None, method="GET", auth=True):
         return self._retry(lambda: self._request(API + path, body, content_type, method, auth), auth)
@@ -259,6 +267,22 @@ class Client:
                      f"(plan {auth.get('plan')}, id {auth.get('id')})")
         return result
 
+    def probe(self) -> dict:
+        """Single-attempt health check: raises TransientError while the service is
+        unavailable, AuthError if the account is not usable, returns stats if fine.
+        Deliberately does not retry - the caller decides how long to wait."""
+        try:
+            result = self._request(API + "/user-stats")
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRY_STATUS:
+                raise TransientError(f"HTTP {exc.code} {exc.reason}") from exc
+            if exc.code in (401, 403):
+                raise AuthError(f"HTTP {exc.code} {exc.reason}") from exc
+            raise IcedriveError(f"HTTP {exc.code} {exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+            raise TransientError(str(exc)) from exc
+        return check_payload(result)
+
     def user_stats(self) -> dict:
         """Storage/bandwidth usage: {storage: {used, max, free, pcent}, bandwidth: {...}}."""
         return self.call("/user-stats")
@@ -290,10 +314,13 @@ class Client:
         if not token:
             return False
         self.token, self.account = token, account
-        validate = validate or self.user_stats
+        validate = validate or self.probe                        # single attempt, no retry storm
         try:
-            validate()                                          # cheapest authenticated call
-        except Exception:                                       # noqa: BLE001 - fall back to a fresh login
+            validate()
+        except TransientError:                                   # service down: nothing can run
+            self.token, self.account = None, None
+            raise
+        except Exception:                                        # noqa: BLE001 - stale token: log in
             self.token, self.account = None, None
             return False
         if self.verbose:

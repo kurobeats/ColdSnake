@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from coldsnake.client import (AuthError, Client, IcedriveError, TransientError,  # noqa: E402
                               check_payload, chunk_ranges, leading_zero_bits, solve_pow,
                               upload_id_for)
-from coldsnake.sync import Mirror                                  # noqa: E402
+from coldsnake.sync import Mirror, PreflightError, preflight         # noqa: E402
 
 
 class FakeClient:
@@ -80,6 +80,57 @@ class ChunkingTests(unittest.TestCase):
         self.assertEqual(first, upload_id_for(42, "/other/dir/big.bin", 1024, 1700000000))
         self.assertNotEqual(first, upload_id_for(42, "/data/big.bin", 1025, 1700000000))
         self.assertNotEqual(first, upload_id_for(43, "/data/big.bin", 1024, 1700000000))
+
+
+class PreflightTests(unittest.TestCase):
+    """Nothing long should start when the service is down or a source is bogus."""
+
+    class ProbeClient:
+        def __init__(self, error=None):
+            self.error = error
+
+        def probe(self):
+            if self.error:
+                raise self.error
+            return {"storage": {"free_human": "2.00 TB", "used_human": "0 B", "max_human": "2.00 TB"}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        os.makedirs(self.src)
+        with open(os.path.join(self.src, "a.txt"), "w") as handle:
+            handle.write("x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_service_unavailable_stops_the_run(self):
+        with self.assertRaises(TransientError):
+            preflight(self.ProbeClient(TransientError("Service temporarily unavailable")),
+                      [(self.src, "Remote")])
+
+    def test_missing_source_is_refused(self):
+        with self.assertRaises(PreflightError) as ctx:
+            preflight(self.ProbeClient(), [(os.path.join(self.tmp.name, "nope"), "Remote")])
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_empty_source_is_refused_unless_allowed(self):
+        empty = os.path.join(self.tmp.name, "empty")
+        os.makedirs(empty)
+        with self.assertRaises(PreflightError) as ctx:
+            preflight(self.ProbeClient(), [(empty, "Remote")])
+        self.assertIn("empty", str(ctx.exception))
+        info = preflight(self.ProbeClient(), [(empty, "Remote")], allow_empty=True)
+        self.assertTrue(info["storage"])
+
+    def test_same_source_twice_is_refused(self):
+        with self.assertRaises(PreflightError) as ctx:
+            preflight(self.ProbeClient(), [(self.src, "One"), (self.src + "/", "Two")])
+        self.assertIn("mirrored twice", str(ctx.exception))
+
+    def test_healthy_run_passes(self):
+        info = preflight(self.ProbeClient(), [(self.src, "Remote")])
+        self.assertIn("storage", info)
 
 
 class PayloadValidationTests(unittest.TestCase):
