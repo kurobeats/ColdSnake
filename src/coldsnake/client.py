@@ -65,9 +65,11 @@ def now() -> str:
 # The API reports failures with HTTP 200 and an error payload, so responses must
 # be checked or a failed listing looks like an empty folder.
 AUTH_ERROR_CODES = (1001, 1010, 2001)
-# "code": 0 "Fatal error encountered" is what the API returns when it is degraded
-# or throttling; retry it slowly rather than hammering.
-TRANSIENT_ERROR_CODES = (0,)
+# The API reports its own outages inside HTTP 200 payloads: "code": 0 "Fatal
+# error encountered" or "Service temporarily unavailable". Retry these slowly
+# rather than hammering.
+TRANSIENT_ERROR_CODES = (0, 429, 500, 502, 503, 504)
+TRANSIENT_MESSAGES = ("fatal error", "temporarily unavailable", "try again")
 
 
 def chunk_ranges(size: int, chunk: int):
@@ -89,7 +91,7 @@ def check_payload(data):
         message = data.get("message") or "unknown error"
         if code in AUTH_ERROR_CODES:
             raise AuthError(f"auth error {code}: {message}")
-        if code in TRANSIENT_ERROR_CODES:
+        if code in TRANSIENT_ERROR_CODES or any(m in message.lower() for m in TRANSIENT_MESSAGES):
             raise TransientError(f"API error {code}: {message}")
         raise IcedriveError(f"API error {code}: {message}")
     return data
