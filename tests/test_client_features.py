@@ -261,5 +261,35 @@ class JournalTests(unittest.TestCase):
                 missing._upload_chunked(0, path, os.stat(path))
 
 
+class FolderCreateTests(unittest.TestCase):
+    """A 2006 "Folder exists" from folder-create must not abort a mirror:
+    the listing can lag a folder a previous run just created."""
+
+    def test_folder_exists_returns_none(self):
+        client = Recorder(responses={"/folder-create":
+                                     {"error": True, "code": 2006, "message": "Folder exists"}})
+        self.assertIsNone(client.create_folder(0, "music"))
+
+    def test_ensure_folder_recovers_by_relisting(self):
+        client = Recorder(responses={"/folder-create":
+                                     {"error": True, "code": 2006, "message": "Folder exists"}})
+        listings = [[], [{"id": 7, "filename": "music", "isFolder": 1}]]
+        client.listing = lambda folder_id=0: listings.pop(0)
+        self.assertEqual(client.ensure_folder(0, "music"), 7)
+
+    def test_transient_error_still_propagates(self):
+        client = Recorder()
+        with mock.patch.object(client, "call", side_effect=TransientError("HTTP 503")):
+            with self.assertRaises(TransientError):
+                client.create_folder(0, "music")
+
+    def test_uncreateable_folder_still_fails_loudly(self):
+        client = Recorder(responses={"/folder-create":
+                                     {"error": True, "code": 2001, "message": "Missing data"}})
+        client.listing = lambda folder_id=0: []
+        with self.assertRaises(IcedriveError):
+            client.ensure_folder(0, "music")
+
+
 if __name__ == "__main__":
     unittest.main()
