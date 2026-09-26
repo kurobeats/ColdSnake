@@ -99,3 +99,39 @@ class UploadJournalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncDbTests(unittest.TestCase):
+    def _db(self):
+        import tempfile
+        from coldsnake.state import SyncDb
+        tmp = tempfile.mkdtemp()
+        return SyncDb(os.path.join(tmp, "sync-db.sqlite")), tmp
+
+    def test_roundtrip(self):
+        db, _ = self._db()
+        self.assertIsNone(db.get("R", "a.txt"))
+        db.put("R", "a.txt", 100, 1700000000)
+        self.assertEqual(db.get("R", "a.txt"), (100, 1700000000))
+        db.put("R", "a.txt", 200, 1700000001)               # replace, not duplicate
+        self.assertEqual(db.get("R", "a.txt"), (200, 1700000001))
+        self.assertIsNone(db.get("Other", "a.txt"))          # keyed per mirror
+
+    def test_none_path_and_corrupt_file_are_best_effort(self):
+        from coldsnake.state import SyncDb
+        self.assertIsNone(SyncDb(None).get("R", "a.txt"))
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "db.sqlite")
+        with open(path, "w") as handle:
+            handle.write("not a database")
+        db = SyncDb(path)                                    # must not raise
+        self.assertIsNone(db.get("R", "a.txt"))
+        db.put("R", "a.txt", 1, 1)                           # no-op, no crash
+
+    def test_directory_is_created(self):
+        import tempfile
+        from coldsnake.state import SyncDb
+        tmp = tempfile.mkdtemp()
+        db = SyncDb(os.path.join(tmp, "sub", "dir", "sync-db.sqlite"))
+        db.put("R", "a", 1, 2)
+        self.assertEqual(db.get("R", "a"), (1, 2))

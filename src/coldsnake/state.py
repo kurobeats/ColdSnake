@@ -12,6 +12,48 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+
+
+class SyncDb:
+    """sqlite record of files that uploaded and verified: (remote, rel) ->
+    (size, mtime). The skip decision reads this instead of listing the remote
+    folder, which is what keeps an incremental run at ~zero API calls (the API
+    throttles listing passes with HTTP 429).
+
+    Best-effort like the journal: a missing, corrupt or unwritable db only
+    costs remote-listing fallback, never data. Delete the file to force a full
+    remote comparison on the next run (that is the resync)."""
+
+    def __init__(self, path: str | None):
+        self._conn = None
+        try:
+            if path is None:
+                return
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self._conn = sqlite3.connect(path)
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS synced "
+                "(remote TEXT, rel TEXT, size INTEGER, mtime INTEGER, PRIMARY KEY (remote, rel))")
+            self._conn.commit()
+        except sqlite3.Error:
+            self._conn = None
+
+    def get(self, remote: str, rel: str) -> tuple[int, int] | None:
+        if self._conn is None:
+            return None
+        row = self._conn.execute(
+            "SELECT size, mtime FROM synced WHERE remote=? AND rel=?",
+            (remote, rel)).fetchone()
+        return (int(row[0]), int(row[1])) if row else None
+
+    def put(self, remote: str, rel: str, size: int, mtime: int) -> None:
+        if self._conn is None:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO synced (remote, rel, size, mtime) VALUES (?,?,?,?)",
+            (remote, rel, size, mtime))
+        self._conn.commit()
 
 
 class UploadJournal:

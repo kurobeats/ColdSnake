@@ -251,3 +251,83 @@ class NameNormalizationTests(unittest.TestCase):
         mirror._listings[""] = client.tree[5]
         needed, _ = mirror.needs_upload("１９８８.mp3", os.stat_result((0, 0, 0, 0, 0, 0, 4, 0, 0, 0)))
         self.assertFalse(needed)
+
+
+class SyncDbMirrorTests(unittest.TestCase):
+    """The sync db decides the skip: an unchanged run must cost zero listings."""
+
+    def _counting_client(self):
+        client = FakeClient()
+        original = client.listing
+        client.listings_made = []
+        client.listing = lambda folder_id=0: (client.listings_made.append(folder_id),
+                                              original(folder_id))[1]
+        return client
+
+    def _run_twice(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "a.txt"), "w") as handle:
+            handle.write("data")
+        from coldsnake.state import SyncDb
+        db = SyncDb(os.path.join(tempfile.mkdtemp(), "db.sqlite"))
+        client = self._counting_client()
+        first = Mirror(client, tmp, "Remote", db=db).run()
+        listing_calls = list(client.listings_made)
+        second = Mirror(client, tmp, "Remote", db=db).run()   # fresh run, same db
+        return first, second, listing_calls, list(client.listings_made)
+
+    def test_second_run_needs_no_listing(self):
+        first, second, after_first, after_second = self._run_twice()
+        self.assertEqual(first.uploaded, 1)
+        self.assertEqual(second.uploaded, 0)
+        self.assertEqual(second.unchanged, 1)
+        self.assertEqual(after_second, after_first, "an unchanged run must not list again")
+
+    def test_local_change_reuploads_and_updates_db(self):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "a.txt")
+        with open(path, "w") as handle:
+            handle.write("data")
+        from coldsnake.state import SyncDb
+        db = SyncDb(os.path.join(tempfile.mkdtemp(), "db.sqlite"))
+        client = self._counting_client()
+        Mirror(client, tmp, "Remote", db=db).run()
+        with open(path, "w") as handle:
+            handle.write("much longer data")
+        os.utime(path, (0, 0))                       # force a different mtime too
+        stats = Mirror(client, tmp, "Remote", db=db).run()
+        self.assertEqual(stats.uploaded, 1)
+        self.assertEqual(db.get("Remote", "a.txt"),
+                         (len("much longer data"), int(os.stat(path).st_mtime)))
+
+    def test_no_db_behaves_as_before(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "a.txt"), "w") as handle:
+            handle.write("data")
+        client = self._counting_client()
+        Mirror(client, tmp, "Remote").run()          # no db: remote listing fallback
+        stats = Mirror(client, tmp, "Remote").run()
+        self.assertEqual(stats.uploaded, 0)
+        self.assertEqual(stats.unchanged, 1)
+
+    def test_failed_verify_is_not_recorded(self):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "a.txt")
+        with open(path, "w") as handle:
+            handle.write("data")
+        from coldsnake.state import SyncDb
+        db = SyncDb(os.path.join(tempfile.mkdtemp(), "db.sqlite"))
+        client = FakeClient()
+        original, calls = client.listing, []
+
+        def listing(folder_id=0):                    # the verify listing fails
+            calls.append(folder_id)
+            if len(calls) > 2:                       # folder resolution passed, verify fails
+                raise RuntimeError("listing down")
+            return original(folder_id)
+
+        client.listing = listing
+        mirror = Mirror(client, tmp, "Remote", db=db)
+        mirror.run()
+        self.assertTrue(mirror.stats.failures[0][1].startswith("verify listing failed"))
+        self.assertIsNone(db.get("Remote", "a.txt"), "unverified upload must stay unrecorded")

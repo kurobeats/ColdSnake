@@ -77,7 +77,7 @@ class Mirror:
     def __init__(self, client: Client, root: str, remote: str,
                  dry_run: bool = False, verbose: bool = False, log=print, quota_check=None,
                  excludes: list[str] | None = None, prune: bool = False,
-                 prune_force: bool = False, prune_delete: bool = False):
+                 prune_force: bool = False, prune_delete: bool = False, db=None):
         self.client = client
         self.root = root
         self.remote = remote
@@ -89,6 +89,10 @@ class Mirror:
         self.prune = prune
         self.prune_force = prune_force
         self.prune_delete = prune_delete
+        # SyncDb of files that uploaded and verified: the skip decision reads it
+        # before the remote listing, which is what keeps an unchanged run at
+        # ~zero API calls. None = always fall back to the remote listing.
+        self.db = db
         self.stats = Stats()
         self._folder_ids: dict[str, int] = {}
         self._listings: dict[str, list[dict]] = {}
@@ -169,9 +173,9 @@ class Mirror:
         self._local_name_keys = {name_key(f) for f in files}
         self.log(f"[{self.remote}] {len(dirs)} dirs / {len(files)} files under {self.root}")
 
-        for rel_dir in sorted(dirs, key=lambda d: (d.count(os.sep), d)):
-            if rel_dir:
-                self.folder_id(rel_dir)
+        # Folder ids are resolved lazily (at upload/prune time), not for every
+        # walked dir up front: a listing call per dir is what a run with no
+        # changes must never cost, and the API throttles listing passes.
 
         # Plan first: needed bytes are known before anything is uploaded, so a
         # full drive (or a bad path) fails fast instead of after thousands of
@@ -187,7 +191,22 @@ class Mirror:
                     self.stats.skipped += 1
                     self.log(f"  skipped {rel}: empty file")
                     continue
-                needed, reason = self.needs_upload(rel, stat)
+                row = self.db.get(self.remote, rel) if self.db else None
+                if row is not None:
+                    # The db record of the last verified upload decides: no API call.
+                    size, mtime = row
+                    if size != stat.st_size:
+                        needed, reason = True, f"size {size}->{stat.st_size}"
+                    elif abs(mtime - int(stat.st_mtime)) > MTIME_TOLERANCE:
+                        needed, reason = True, "mtime"
+                    else:
+                        needed, reason = False, "same"
+                else:
+                    needed, reason = self.needs_upload(rel, stat)
+                    if not needed and self.db:
+                        # The server already agrees: remember it so later runs
+                        # never re-list this folder for this file.
+                        self.db.put(self.remote, rel, stat.st_size, int(stat.st_mtime))
                 if not needed:
                     self.stats.unchanged += 1
                     continue
@@ -214,7 +233,8 @@ class Mirror:
                 self.stats.uploaded += 1
                 self.stats.bytes += stat.st_size
                 parent = os.path.dirname(rel)
-                self._uploaded.setdefault(parent, []).append((os.path.basename(rel), stat.st_size))
+                self._uploaded.setdefault(parent, []).append(
+                    (os.path.basename(rel), stat.st_size, int(stat.st_mtime)))
                 self._listings.setdefault(parent, []).append(
                     {"filename": os.path.basename(rel), "filesize": stat.st_size,
                      "moddate": int(stat.st_mtime), "isFolder": 0})
@@ -243,7 +263,15 @@ class Mirror:
         deletions: list[tuple[int, int, str]] = []
         remote_total = 0
         for rel_dir in sorted(self._walked_dirs):
-            folder_id = self._folder_ids.get(rel_dir)
+            try:
+                folder_id = self.folder_id(rel_dir)      # lazily resolved now
+            except (TransientError, AuthError):
+                raise                                    # outage: report it
+            except Exception as exc:                     # noqa: BLE001 - one dir must not stop the rest
+                rel = rel_dir or "/"
+                self.stats.failures.append((rel, f"folder resolve failed: {exc}"))
+                self.log(f"  FAILED prune folder {rel}: {str(exc)[:200]}")
+                continue
             if folder_id is None or folder_id < 0:      # never created, nothing to prune
                 continue
             for entry in self.client.listing(folder_id):
@@ -320,7 +348,7 @@ class Mirror:
             except Exception as exc:                            # noqa: BLE001
                 self.stats.failures.append((rel_dir or "/", f"verify listing failed: {exc}"))
                 continue
-            for name, size in uploaded:
+            for name, size, mtime in uploaded:
                 entry = listing.get(name_key(name))
                 target = f"{rel_dir}/{name}" if rel_dir else name
                 if entry is None:
@@ -329,5 +357,7 @@ class Mirror:
                     self.stats.failures.append((target, f"size {entry.get('filesize')} != {size}"))
                 else:
                     self.stats.verified += 1
+                    if self.db:                          # verified: the next run skips via the db
+                        self.db.put(self.remote, target, size, mtime)
         self.log(f"[{self.remote}] verified {self.stats.verified} uploaded file(s) "
                  f"across {len(self._uploaded)} folder(s)")

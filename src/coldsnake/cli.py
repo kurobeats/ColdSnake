@@ -289,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="permanently delete pruned files instead of trashing them")
     mirror.add_argument("--no-upload-journal", action="store_true",
                         help="do not resume a partial upload from a previous run")
+    mirror.add_argument("--no-sync-db", action="store_true",
+                        help="do not use the local sync db; list the remote every run")
     mirror.add_argument("--json", action="store_true",
                         help="emit one JSON summary on stdout (progress goes to stderr)")
     mirror.add_argument("--report", metavar="PATH", help="also write the JSON summary to PATH")
@@ -537,6 +539,10 @@ def main(argv: list[str] | None = None) -> int:
         if not args.no_upload_journal:
             from .state import UploadJournal               # lazy: the CLI must not need state to import
             journal = UploadJournal(os.path.join(os.path.dirname(DEFAULT_CONFIG), "upload-journal.json"))
+        db = None
+        if not args.no_sync_db:
+            from .state import SyncDb
+            db = SyncDb(os.path.join(os.path.dirname(DEFAULT_CONFIG), "sync-db.sqlite"))
         client = build_client(args, config, journal=journal)
         excludes = list(args.exclude) + list(config.get("exclude", []))
 
@@ -560,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
             mirrorer = Mirror(client, local, remote, dry_run=args.dry_run, verbose=args.verbose,
                               log=log, quota_check=quota_check, excludes=excludes,
                               prune=args.prune, prune_force=args.prune_force,
-                              prune_delete=args.prune_delete)
+                              prune_delete=args.prune_delete, db=db)
             try:
                 stats = mirrorer.run()
             except (TransientError, AuthError):
