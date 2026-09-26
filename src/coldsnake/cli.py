@@ -77,7 +77,7 @@ class Report:
 def mirror_document(local: str, remote: str, stats) -> dict:
     """One mirrors[] entry; failure paths/errors are truncated as the logs truncate them."""
     return {"local": local, "remote": remote, "uploaded": stats.uploaded,
-            "unchanged": stats.unchanged, "bytes": stats.bytes, "verified": stats.verified,
+            "unchanged": stats.unchanged, "skipped": stats.skipped, "bytes": stats.bytes, "verified": stats.verified,
             "trashed": stats.trashed, "deleted": stats.deleted, "failed": stats.failed(),
             "failures": [{"path": path, "error": str(error)[:200]}
                          for path, error in stats.failures]}
@@ -572,12 +572,12 @@ def main(argv: list[str] | None = None) -> int:
                 failures += 1
                 if report is not None:
                     report.mirrors.append({"local": local, "remote": remote, "uploaded": 0,
-                                           "unchanged": 0, "bytes": 0, "verified": 0,
+                                           "unchanged": 0, "skipped": 0, "bytes": 0, "verified": 0,
                                            "trashed": 0, "deleted": 0, "failed": 1,
                                            "failures": [{"path": remote, "error": str(exc)[:200]}]})
                 continue
             log(f"{remote}: uploaded {stats.uploaded} ({stats.bytes / 1e6:.1f} MB), "
-                  f"unchanged {stats.unchanged}, verified {stats.verified}, "
+                  f"unchanged {stats.unchanged}, skipped {stats.skipped}, verified {stats.verified}, "
                   f"trashed {stats.trashed}, deleted {stats.deleted}, failed {stats.failed()}")
             failures += stats.failed()
             if report is not None:

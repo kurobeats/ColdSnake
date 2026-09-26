@@ -33,6 +33,7 @@ class FakeStats:
     def __init__(self, failures=()):
         self.uploaded = 3
         self.unchanged = 10
+        self.skipped = 0
         self.bytes = 1234
         self.verified = 3
         self.trashed = 0
@@ -102,7 +103,7 @@ class JsonMirrorTests(unittest.TestCase):
         self.assertEqual(len(doc["mirrors"]), 1)
         entry = doc["mirrors"][0]
         self.assertEqual(entry, {"local": self.src, "remote": "R", "uploaded": 3,
-                                 "unchanged": 10, "bytes": 1234, "verified": 3,
+                                 "unchanged": 10, "skipped": 0, "bytes": 1234, "verified": 3,
                                  "trashed": 0, "deleted": 0, "failed": 0, "failures": []})
 
     def test_failed_file_flips_ok_and_exit_code(self):

@@ -27,6 +27,7 @@ class PreflightError(RuntimeError):
 class Stats:
     uploaded: int = 0
     unchanged: int = 0
+    skipped: int = 0
     bytes: int = 0
     verified: int = 0
     trashed: int = 0
@@ -173,6 +174,12 @@ class Mirror:
             path = os.path.join(self.root, rel)
             try:
                 stat = os.stat(path)
+                if stat.st_size == 0:
+                    # The API refuses empty uploads; a legit empty file (e.g. a
+                    # Syncthing .stignore marker) must not count as a failure.
+                    self.stats.skipped += 1
+                    self.log(f"  skipped {rel}: empty file")
+                    continue
                 needed, reason = self.needs_upload(rel, stat)
                 if not needed:
                     self.stats.unchanged += 1
