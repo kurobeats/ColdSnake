@@ -217,6 +217,7 @@ class Client:
         """
         last = None
         transient = False
+        wait = 0
         for attempt in range(self.retries + 1):
             try:
                 return operation()
@@ -240,10 +241,16 @@ class Client:
                     continue
                 if exc.code not in RETRY_STATUS:
                     raise
+                if exc.code == 429:
+                    # The throttle answer. The exponential 2^n backoff below is
+                    # too hot for it (seen live: run aborted after 4 attempts of
+                    # 1-4s). Honor Retry-After, else wait a full minute.
+                    retry_after = (exc.headers or {}).get("Retry-After", "")
+                    wait = min(int(retry_after), 300) if retry_after.isdigit() else 60
             except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
                 last, transient = exc, True
             if attempt < self.retries:
-                time.sleep(2 ** attempt)
+                time.sleep(wait or 2 ** attempt)
         message = f"request failed after {self.retries + 1} attempts: {last}"
         raise TransientError(message) if transient else IcedriveError(message)
 

@@ -302,3 +302,44 @@ class EnsureFolderNormalizationTests(unittest.TestCase):
             "data": [{"id": 9, "filename": "Dante Mars Ajeto!", "isFolder": 1}]}
         self.assertEqual(client.ensure_folder(0, "Dante Mars Ajeto\uff01"), 9)
         self.assertFalse(any(c["path"] == "/folder-create" for c in client.calls))  # no create call
+
+
+class RetryBackoffTests(unittest.TestCase):
+    """429 is the throttle answer: retry slowly or a long listing pass aborts."""
+
+    def _client_with_429s(self, times):
+        client = Recorder()
+        responses = [urllib.error.HTTPError("url", 429, "Too Many Requests",
+                                            {"Retry-After": "60"}, None)] * times
+        calls = {"n": 0}
+
+        def operation():
+            index = calls["n"]
+            calls["n"] += 1
+            if index < times:
+                raise responses[index]
+            return "ok"
+
+        with mock.patch("time.sleep") as slept:
+            result = client._retry(operation, auth=False)
+        return result, [c.args[0] for c in slept.call_args_list]
+
+    def test_429_waits_retry_after_not_exponential(self):
+        result, sleeps = self._client_with_429s(times=2)
+        self.assertEqual(result, "ok")
+        self.assertEqual(sleeps, [60, 60])
+
+    def test_429_without_header_waits_60s(self):
+        client = Recorder()
+        state = {"n": 0}
+
+        def operation():
+            state["n"] += 1
+            if state["n"] == 1:
+                raise urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
+            return "ok"
+
+        with mock.patch("time.sleep") as slept:
+            result = client._retry(operation, auth=False)
+        self.assertEqual(result, "ok")
+        self.assertEqual(slept.call_args_list[0].args[0], 60)
