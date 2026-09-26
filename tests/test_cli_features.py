@@ -187,6 +187,12 @@ class CliMirrorTests(unittest.TestCase):
                 return self._path
 
         module.UploadJournal = UploadJournal
+
+        class SyncDb:
+            def __init__(self, path):
+                seen.append(path)
+
+        module.SyncDb = SyncDb
         return module
 
     def mirror_run(self, argv, seen):
@@ -235,16 +241,19 @@ class CliMirrorTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(recorded["prune_delete"])
         self.assertTrue(recorded["prune"])
-        # journal path sits next to DEFAULT_CONFIG
+        # journal and sync-db paths sit next to DEFAULT_CONFIG
         self.assertEqual(seen, [os.path.join(os.path.dirname(cli.DEFAULT_CONFIG),
-                                             "upload-journal.json")])
+                                             "upload-journal.json"),
+                                os.path.join(os.path.dirname(cli.DEFAULT_CONFIG),
+                                             "sync-db.sqlite")])
         self.assertEqual(len(calls), 1)
         self.assertIsNotNone(calls[0])
 
     def test_no_upload_journal_disables_it(self):
         seen = []
         code, _, calls = self.mirror_run(
-            ["mirror", "--local", self.src, "--remote", "R", "--no-upload-journal"], seen)
+            ["mirror", "--local", self.src, "--remote", "R",
+             "--no-upload-journal", "--no-sync-db"], seen)
         self.assertEqual(code, 0)
         self.assertEqual(calls, [None])
         self.assertEqual(seen, [])                       # state module never imported

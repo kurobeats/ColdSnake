@@ -85,6 +85,7 @@ Three more files live under `~/.config/coldsnake/` and are safe to delete:
 | `token` (0600) | cached bearer token + account info, so runs rarely need to log in |
 | `device-id` | stable client id, sent as `X-Icedrive-Device-Id` |
 | `upload-journal.json` | chunks already sent, so a killed run resumes (safe to delete) |
+| `sync-db.sqlite` | what uploaded and verified (size+mtime), so unchanged runs cost ~zero API calls (safe to delete: the next run re-lists the remote) |
 
 ## Configure mirrors
 
@@ -122,6 +123,7 @@ coldsnake mirror --allow-empty        # tolerate an empty source directory
 coldsnake mirror --exclude '*.tmp' --exclude '.stfolder/*' --prune
 coldsnake mirror --prune-delete       # prune permanently instead of trashing
 coldsnake mirror --no-upload-journal  # do not resume partial uploads next run
+coldsnake mirror --no-sync-db         # always compare against the remote listing
 coldsnake download --remote Sync --local /tmp/restore          # whole tree
 coldsnake download --remote Sync --file docs/report.pdf --local /tmp/restore
 coldsnake download --remote Sync --file docs/report.pdf --version 1 --local /tmp/old
