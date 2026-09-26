@@ -77,7 +77,7 @@ def run(fake, argv):
 
 
 class FakeStats:
-    uploaded = unchanged = bytes = verified = trashed = deleted = 0
+    uploaded = unchanged = skipped = bytes = verified = trashed = deleted = 0
 
     def failed(self):
         return 0

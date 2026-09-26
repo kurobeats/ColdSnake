@@ -198,3 +198,31 @@ class PruneRemovalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmptyFileTests(unittest.TestCase):
+    """A legit empty local file (Syncthing's .stignore) is skipped, not a failure."""
+
+    def _mirror_with_empty_file(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, ".stignore"), "w"):
+            pass
+        with open(os.path.join(tmp, "real.txt"), "w") as handle:
+            handle.write("data")
+        return Mirror(FakeClient(), tmp, "Remote"), tmp
+
+    def test_empty_file_is_skipped_not_failed(self):
+        mirror, tmp = self._mirror_with_empty_file()
+        stats = mirror.run()
+        self.assertEqual(stats.skipped, 1)
+        self.assertEqual(stats.failed(), 0)
+        self.assertEqual(stats.uploaded, 1)
+
+    def test_empty_file_repeats_cleanly(self):
+        mirror, _ = self._mirror_with_empty_file()
+        mirror.run()
+        from coldsnake.sync import Stats
+        mirror.stats = Stats()               # fresh counters, same fake remote
+        stats = mirror.run()                 # every run must stay failure-free
+        self.assertEqual(stats.skipped, 1)
+        self.assertEqual(stats.failed(), 0)
