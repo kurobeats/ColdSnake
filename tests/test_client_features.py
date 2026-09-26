@@ -293,3 +293,12 @@ class FolderCreateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnsureFolderNormalizationTests(unittest.TestCase):
+    def test_ensure_folder_reuses_normalized_existing(self):
+        client = Recorder()
+        client.responses["/collection?type=cloud&folderId=0"] = {
+            "data": [{"id": 9, "filename": "Dante Mars Ajeto!", "isFolder": 1}]}
+        self.assertEqual(client.ensure_folder(0, "Dante Mars Ajeto\uff01"), 9)
+        self.assertFalse(any(c["path"] == "/folder-create" for c in client.calls))  # no create call

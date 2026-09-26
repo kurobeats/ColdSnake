@@ -226,3 +226,28 @@ class EmptyFileTests(unittest.TestCase):
         stats = mirror.run()                 # every run must stay failure-free
         self.assertEqual(stats.skipped, 1)
         self.assertEqual(stats.failed(), 0)
+
+
+class NameNormalizationTests(unittest.TestCase):
+    """The server normalizes item names (NFKC): a fullwidth '！' exists as the
+    ASCII '!'. Mirror matching must go through the same rule, or folders that
+    already exist are re-created (2006) and the mirror aborts."""
+
+    def test_folder_id_reuses_normalized_existing_folder(self):
+        client = FakeClient()
+        existing = {"id": 99, "filename": "Dante Mars Ajeto!", "isFolder": 1}
+        client.tree[0] = [{"id": 5, "filename": "Remote", "isFolder": 1}]
+        client.tree[5] = [existing]
+        mirror = Mirror(client, "/tmp", "Remote")
+        rel = "Dante Mars Ajeto\uff01"
+        self.assertEqual(mirror.folder_id(rel), 99)      # no create attempted
+
+    def test_needs_upload_matches_normalized_file_names(self):
+        client = FakeClient()
+        client.tree[0] = [{"id": 5, "filename": "Remote", "isFolder": 1}]
+        client.tree[5] = [{"filename": "１９８８.mp3", "filesize": 4, "moddate": 0, "isFolder": 0}]
+        mirror = Mirror(client, "/tmp", "Remote")
+        mirror._folder_ids[""] = 5
+        mirror._listings[""] = client.tree[5]
+        needed, _ = mirror.needs_upload("１９８８.mp3", os.stat_result((0, 0, 0, 0, 0, 0, 4, 0, 0, 0)))
+        self.assertFalse(needed)

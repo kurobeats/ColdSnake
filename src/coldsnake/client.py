@@ -25,6 +25,7 @@ import os
 import secrets
 import ssl
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,6 +83,14 @@ def upload_id_for(folder_id: int, path: str, size: int, mtime: int) -> str:
     continues the same partial upload instead of creating a second one."""
     seed = f"{folder_id}/{os.path.basename(path)}/{size}/{mtime}"
     return hashlib.sha1(seed.encode()).hexdigest()
+
+
+def name_key(name: str) -> str:
+    """How the server compares item names: seen live, it collapsed a folder
+    named 'Dante Mars Ajeto！' (fullwidth U+FF01) onto the ASCII 'Dante Mars
+    Ajeto!' and refused a second create with 2006. NFKC is the rule that
+    reproduces that collapse; compare names through it."""
+    return unicodedata.normalize("NFKC", name)
 
 
 def check_payload(data):
@@ -353,15 +362,18 @@ class Client:
         return None
 
     def ensure_folder(self, parent_id: int, name: str) -> int:
-        """Return the id of a child folder, creating it if needed."""
+        """Return the id of a child folder, creating it if needed.
+
+        Matching goes through name_key: the server normalizes names, so a
+        fullwidth '！' can already exist as the ASCII '!'."""
         for entry in self.listing(parent_id):
-            if entry.get("filename") == name and entry.get("isFolder"):
+            if entry.get("isFolder") and name_key(entry.get("filename", "")) == name_key(name):
                 return entry["id"]
         created = self.create_folder(parent_id, name)
         if created:
             return created
         for entry in self.listing(parent_id):        # lost a race, or the name existed
-            if entry.get("filename") == name and entry.get("isFolder"):
+            if entry.get("isFolder") and name_key(entry.get("filename", "")) == name_key(name):
                 return entry["id"]
         raise IcedriveError(f"cannot create remote folder {name!r}")
 
