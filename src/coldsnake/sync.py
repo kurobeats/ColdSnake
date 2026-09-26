@@ -14,7 +14,7 @@ import fnmatch
 import os
 from dataclasses import dataclass, field
 
-from .client import AuthError, Client, TransientError
+from .client import AuthError, Client, TransientError, name_key
 
 MTIME_TOLERANCE = 2          # seconds; inside this a file counts as unchanged
 
@@ -94,6 +94,7 @@ class Mirror:
         self._listings: dict[str, list[dict]] = {}
         self._uploaded: dict[str, list[tuple[str, int]]] = {}
         self._local_files: set[str] = set()
+        self._local_name_keys: set[str] = set()
         self._walked_dirs: list[str] = []
 
     def excluded(self, rel: str) -> bool:
@@ -119,8 +120,12 @@ class Mirror:
             parent_id, name = self.folder_id(os.path.dirname(rel)), os.path.basename(rel)
         parent_entries = [] if parent_id < 0 else self.client.listing(parent_id)
         existing = next((e for e in parent_entries
-                         if e.get("filename") == name and e.get("isFolder")), None)
+                         if e.get("isFolder")
+                         and name_key(e.get("filename", "")) == name_key(name)), None)
         if existing is not None:
+            if existing.get("filename") != name and self.verbose:
+                self.log(f"  {name!r} uses the existing folder {existing['filename']!r} "
+                         f"(the server normalizes names)")
             self._folder_ids[rel] = existing["id"]
             return existing["id"]
         if self.dry_run:
@@ -135,7 +140,8 @@ class Mirror:
     # --- decisions -------------------------------------------------------
     def needs_upload(self, rel: str, stat: os.stat_result) -> tuple[bool, str]:
         entry = next((e for e in self.entries(os.path.dirname(rel))
-                      if e.get("filename") == os.path.basename(rel) and not e.get("isFolder")), None)
+                      if name_key(e.get("filename", "")) == name_key(os.path.basename(rel))
+                      and not e.get("isFolder")), None)
         if entry is None:
             return True, "new"
         if int(entry.get("filesize", -1)) != stat.st_size:
@@ -160,6 +166,7 @@ class Mirror:
             files.extend(os.path.join(rel_dir, name) if rel_dir else name for name in kept)
         self._walked_dirs = dirs
         self._local_files = set(files)
+        self._local_name_keys = {name_key(f) for f in files}
         self.log(f"[{self.remote}] {len(dirs)} dirs / {len(files)} files under {self.root}")
 
         for rel_dir in sorted(dirs, key=lambda d: (d.count(os.sep), d)):
@@ -245,7 +252,9 @@ class Mirror:
                 remote_total += 1
                 name = entry["filename"]
                 rel = os.path.join(rel_dir, name) if rel_dir else name
-                if rel not in self._local_files and not self.excluded(rel):
+                # names are compared through name_key: a locally NFKC-different
+                # name may have been stored normalized by the server
+                if name_key(rel) not in self._local_name_keys and not self.excluded(rel):
                     deletions.append((folder_id, entry["id"], rel))
         if not deletions:
             self.log(f"[{self.remote}] prune: nothing to remove")
@@ -305,14 +314,14 @@ class Mirror:
         """Re-list every folder written to and check the sizes we uploaded."""
         for rel_dir, uploaded in self._uploaded.items():
             try:
-                listing = {e["filename"]: e for e in self.client.listing(self.folder_id(rel_dir))}
+                listing = {name_key(e["filename"]): e for e in self.client.listing(self.folder_id(rel_dir))}
             except (TransientError, AuthError):
                 raise                                       # cannot verify while the service is down
             except Exception as exc:                            # noqa: BLE001
                 self.stats.failures.append((rel_dir or "/", f"verify listing failed: {exc}"))
                 continue
             for name, size in uploaded:
-                entry = listing.get(name)
+                entry = listing.get(name_key(name))
                 target = f"{rel_dir}/{name}" if rel_dir else name
                 if entry is None:
                     self.stats.failures.append((target, "missing after upload"))
