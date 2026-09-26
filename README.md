@@ -469,7 +469,7 @@ request, against Python 3.11, 3.12 and 3.13. The same workflow builds the
 packages, and so can you:
 
 ```bash
-python -m build        # writes dist/coldsnake-0.1.1.tar.gz and .whl
+python -m build        # writes dist/coldsnake-0.1.2.tar.gz and .whl
 ```
 
 Publication to PyPI is **not** automated: releases are built and uploaded by
