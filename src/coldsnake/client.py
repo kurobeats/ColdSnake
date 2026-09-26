@@ -339,7 +339,15 @@ class Client:
     def create_folder(self, parent_id: int, name: str) -> int | None:
         body, content_type = _multipart({"request": "folder-create", "type": "folder-create",
                                          "parentId": str(parent_id), "filename": name})
-        result = self.call("/folder-create", body, content_type, "POST")
+        try:
+            result = self.call("/folder-create", body, content_type, "POST")
+        except (TransientError, AuthError):
+            raise                                       # outage/credentials: not a naming problem
+        except IcedriveError:
+            # Seen live: 2006 "Folder exists" when the listing lags a folder a
+            # previous run (or a parallel one) just created. ensure_folder's
+            # re-list below turns None into the real id.
+            return None
         if isinstance(result, dict) and not result.get("error"):
             return result.get("folderId") or result.get("id")
         return None
