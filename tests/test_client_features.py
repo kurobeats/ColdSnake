@@ -1,5 +1,6 @@
 """Client-side feature tests: trash/restore, versions, batch delete, the
 download engine split, and the cross-run upload journal. Network is faked."""
+import json
 import os
 import sys
 import tempfile
@@ -193,7 +194,7 @@ class _JournalClient(Client):
     def listing(self, folder_id=0):
         return list(self.listing_rows)
 
-    def _send(self, path, preamble, trailer, length, headers, offset, size):
+    def _send(self, path, preamble, trailer, length, headers, offset, size, pin=None):
         self.sent.append(offset)
         if offset == self.fail_at:
             raise IcedriveError("boom")
@@ -259,6 +260,105 @@ class JournalTests(unittest.TestCase):
                 journal.mark(upload_id, offset)
             with self.assertRaises(IcedriveError):
                 missing._upload_chunked(0, path, os.stat(path))
+
+
+class _FakeEndpointsClient(Client):
+    """Real _send, faked deposit nodes: shows which netloc each chunk reaches."""
+
+    def __init__(self, journal=None):
+        super().__init__("e@example.com", "pw", chunk_size=4, journal=journal)
+        self.posted = []
+
+    def upload_endpoints(self):
+        return list(self.endpoint_urls)
+
+    def _connection(self, netloc):
+        return _FakeConn(self, netloc)
+
+
+class _FakeConn:
+    """Records which netloc got the chunk; answers with the configured bodies."""
+
+    def __init__(self, client, netloc):
+        self.client = client
+        self.netloc = netloc
+
+    def close(self):
+        pass
+
+    def putrequest(self, *a, **k):
+        pass
+
+    def putheader(self, *a):
+        pass
+
+    def endheaders(self):
+        pass
+
+    def send(self, data):
+        pass
+
+    def getresponse(self):
+        self.client.posted.append(self.netloc)
+        body = json.dumps(self.client.responses.pop(0)).encode()
+        return _FakeResponse(200, {}, body)
+
+
+class PinEndpointTests(unittest.TestCase):
+    """Chunks of one upload must all land on one deposit node: the server
+    assembles only from parts on a single node ("Error handling upload parts")."""
+
+    def _client(self, responses, urls=("https://a.example/post", "https://b.example/post"),
+                journal=None):
+        client = _FakeEndpointsClient(journal)
+        client.endpoint_urls = list(urls)
+        client.responses = list(responses)
+        return client
+
+    def test_chunks_pin_the_first_node_that_accepts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"0123456789")           # offsets 0, 4, 8
+            # a bounces the first chunk, b accepts and is pinned for the rest
+            client = self._client(
+                [{"error": True, "code": 0, "message": "x"}, {"message": "Upload Successful"},
+                 {"message": "Upload Successful"}, {"message": "Upload Successful"}])
+            client._upload_chunked(0, path, os.stat(path))
+            self.assertEqual(client.posted,
+                             ["a.example", "b.example", "b.example", "b.example"],
+                             "later chunks must go to the node that accepted an earlier one")
+
+    def test_unassemblable_parts_clear_the_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"0123456789")
+            journal = UploadJournal(os.path.join(tmp, "journal.json"))
+            upload_id = upload_id_for(0, path, 10, int(os.stat(path).st_mtime))
+            journal.mark(upload_id, 0)
+            client = self._client([{"error": True, "code": 0,
+                                    "message": "Error handling upload parts"}] * 20,
+                                  journal=journal)
+            with self.assertRaises(IcedriveError) as caught:
+                client._upload_chunked(0, path, os.stat(path))
+            self.assertIn("upload parts", str(caught.exception))
+            self.assertEqual(journal.done(upload_id), set(),
+                             "the poison id must be dropped so the file re-uploads whole")
+
+    def test_other_chunk_errors_keep_the_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"0123456789")
+            journal = UploadJournal(os.path.join(tmp, "journal.json"))
+            upload_id = upload_id_for(0, path, 10, int(os.stat(path).st_mtime))
+            journal.mark(upload_id, 0)
+            client = _JournalClient(journal, fail_at=4)
+            with self.assertRaises(IcedriveError):
+                client._upload_chunked(0, path, os.stat(path))
+            self.assertEqual(journal.done(upload_id), {0},
+                             "a plain chunk failure must still resume")
 
 
 class FolderCreateTests(unittest.TestCase):
