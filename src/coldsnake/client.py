@@ -451,11 +451,26 @@ class Client:
         return preamble, trailer, length, headers
 
     def _send(self, path: str, preamble: bytes, trailer: bytes, length: int, headers: dict,
-              offset: int, size: int):
-        """POST one request, streaming [offset, offset+size) of the file."""
+              offset: int, size: int, pin: dict | None = None):
+        """POST one request, streaming [offset, offset+size) of the file.
+
+        pin: optional dict; the deposit node that accepts one chunk of a
+        multi-chunk upload is remembered there, and later chunks of the same
+        upload go to it alone. The server assembles an upload only from parts
+        that landed on one node - parts scattered across its mirrors are
+        answered with {"code": 0, "message": "Error handling upload parts"}
+        when the last chunk asks for assembly."""
         last = None
         for attempt in range(self.retries + 1):
-            for endpoint in self.upload_endpoints():
+            endpoints = self.upload_endpoints()
+            if pin and pin.get("netloc"):
+                pinned = [e for e in endpoints
+                          if urllib.parse.urlsplit(e).netloc == pin["netloc"]]
+                if pinned:
+                    endpoints = pinned
+                else:
+                    pin.clear()          # pinned node left the list: pick a new one
+            for endpoint in endpoints:
                 parsed = urllib.parse.urlsplit(endpoint)
                 target = parsed.path + ("?" + parsed.query if parsed.query else "")
                 conn = None
@@ -490,6 +505,8 @@ class Client:
                         last = json.dumps(result)[:200]
                         self._drop_connection(parsed.netloc)
                         continue
+                    if pin is not None:
+                        pin["netloc"] = parsed.netloc
                     return result
                 except Exception as exc:                        # noqa: BLE001 - try the next mirror
                     last = exc
@@ -516,12 +533,26 @@ class Client:
         # megabytes, so not re-sending them is the whole point of the journal.
         done = self.journal.done(upload_id) if self.journal else set()
         result = None
+        pin: dict = {}                                   # one deposit node per upload
         for offset, size in chunk_ranges(stat.st_size, chunk):
             if offset in done:
                 continue
             preamble, trailer, length, headers = self._upload_body(
                 folder_id, path, stat, upload_id=upload_id, size=size, offset=offset)
-            result = self._send(path, preamble, trailer, length, headers, offset, size)
+            try:
+                result = self._send(path, preamble, trailer, length, headers, offset, size, pin)
+            except IcedriveError as exc:
+                if "upload parts" in str(exc):
+                    # Parts of this upload id are scattered across deposit nodes
+                    # and the server cannot assemble them. Drop the journal so the
+                    # next run re-sends the whole file to a single node; the same
+                    # upload id overwrites its parts, so a complete re-send heals it.
+                    if self.journal:
+                        self.journal.clear(upload_id)
+                    raise IcedriveError(
+                        f"upload parts of {path} cannot be assembled; "
+                        f"journal cleared, next run re-uploads whole") from exc
+                raise
             if self.journal:
                 self.journal.mark(upload_id, offset)
         if result is None:

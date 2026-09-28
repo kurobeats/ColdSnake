@@ -227,6 +227,15 @@ cp systemd/coldsnake.service systemd/coldsnake.timer ~/.config/systemd/user/
 systemctl --user enable --now coldsnake.timer
 ```
 
+A run is a `Type=oneshot` job, so `systemctl --user start coldsnake` (and
+`restart`) blocks until the whole mirror finishes - hours on a first run. Use
+`--no-block`:
+
+```bash
+systemctl --user restart --no-block coldsnake   # returns immediately
+journalctl --user -u coldsnake -f               # watch the run
+```
+
 For a system-wide install as a dedicated user (e.g. `backup`), use the
 `coldsnake@.service` template + `coldsnake@.timer`:
 
@@ -314,6 +323,12 @@ Details that matter:
   silently; resuming with a *different* id is rejected (`Error handling upload
   parts`). So the id is derived from destination + size + mtime and reused across
   retries and runs, and the end-of-upload size check is mandatory.
+* **One deposit node per upload** - `geo-fileserver-list` hands out several signed
+  deposit nodes and parts are assembled only from parts on one of them; chunks of
+  the same id spread over two nodes fail the final chunk with the same `Error
+  handling upload parts`. The node that accepts a file's first chunk is therefore
+  remembered and used for the rest of that file, and a file that still cannot be
+  assembled drops its journal entry so the next run re-sends it whole to one node.
 * **Client identity** - Icedrive's own clients send `X-App-Method: sync` and a stored
   `X-Icedrive-Device-Id`; ColdSnake sends both. The User-Agent matters: a desktop
   string is refused with `HTTP 403 code 5001` ("Official Icedrive mobile client
@@ -469,7 +484,7 @@ request, against Python 3.11, 3.12 and 3.13. The same workflow builds the
 packages, and so can you:
 
 ```bash
-python -m build        # writes dist/coldsnake-0.1.2.tar.gz and .whl
+python -m build        # writes dist/coldsnake-0.1.3.tar.gz and .whl
 ```
 
 Publication to PyPI is **not** automated: releases are built and uploaded by
