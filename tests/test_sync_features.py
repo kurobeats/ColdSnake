@@ -331,3 +331,60 @@ class SyncDbMirrorTests(unittest.TestCase):
         mirror.run()
         self.assertTrue(mirror.stats.failures[0][1].startswith("verify listing failed"))
         self.assertIsNone(db.get("Remote", "a.txt"), "unverified upload must stay unrecorded")
+
+
+class MungingClient(FakeClient):
+    """Icedrive mangles disliked names at upload time (live-verified):
+    emoji become '?', a leading space is stripped, long names truncate.
+    The upload itself succeeds and the size is exact."""
+
+    def upload(self, folder_id, path):
+        super().upload(folder_id, path)
+        entry = self.tree[folder_id][-1]
+        entry["filename"] = entry["filename"].lstrip().replace("🌑", "?")
+
+
+class MangledNameVerifyTests(unittest.TestCase):
+    """A perfect-size file under a mangled name must verify, not loop nightly."""
+
+    def _run(self, client, files):
+        tmp = tempfile.mkdtemp()
+        for name, data in files.items():
+            with open(os.path.join(tmp, name), "w") as handle:
+                handle.write(data)
+        from coldsnake.state import SyncDb
+        db = SyncDb(os.path.join(tempfile.mkdtemp(), "db.sqlite"))
+        mirror = Mirror(client, tmp, "Remote", db=db)
+        stats = mirror.run()
+        return stats, db
+
+    def test_mangled_name_verifies_by_size(self):
+        stats, db = self._run(MungingClient(), {"Song 🌑🌒🌓🌔🌕.ogg": "x" * 40})
+        self.assertEqual(stats.verified, 1)
+        self.assertEqual(len(stats.failures), 0)
+        self.assertIsNotNone(db.get("Remote", "Song 🌑🌒🌓🌔🌕.ogg"))
+
+    def test_leading_space_mangled_name_verifies(self):
+        stats, db = self._run(MungingClient(), {" 473mL - Dailybooth.mp4": "x" * 100})
+        self.assertEqual(stats.verified, 1)
+        self.assertEqual(len(stats.failures), 0)
+        self.assertIsNotNone(db.get("Remote", " 473mL - Dailybooth.mp4"))
+
+    def test_ambiguous_size_does_not_false_verify(self):
+        # both files lose their names server-side and share a size: no match
+        stats, db = self._run(MungingClient(), {"a 🌑.ogg": "x" * 40, "b 🌑.ogg": "x" * 40})
+        self.assertEqual(stats.verified, 0)
+        self.assertEqual(len(stats.failures), 2)
+        self.assertIsNone(db.get("Remote", "a 🌑.ogg"))
+
+    def test_silently_failed_upload_still_fails(self):
+        # upload reports success but the file never lands: the fallback must
+        # not rescue it, and there is no same-size entry to be confused with
+        class Dropping(MungingClient):
+            def upload(self, folder_id, path):
+                return {"error": False}
+
+        stats, db = self._run(Dropping(), {"gone 🌑.ogg": "x" * 40})
+        self.assertEqual(stats.verified, 0)
+        self.assertEqual(len(stats.failures), 1)
+        self.assertIsNone(db.get("Remote", "gone 🌑.ogg"))

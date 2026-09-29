@@ -338,6 +338,23 @@ class Mirror:
                 self.stats.failures.append((rel, str(exc)[:200]))
                 self.log(f"  FAILED prune {rel}: {str(exc)[:200]}")
 
+    def _find_uploaded(self, listing: dict[str, dict], name: str, size: int) -> dict | None:
+        """The remote entry an upload produced: by name first, then by size.
+
+        The server silently mangles names it dislikes (live-verified: emoji
+        become '?' - '🌑🌒🌓🌔🌕.ogg' -> '?????.ogg' - a leading space is
+        stripped, long names truncate), so an upload with the exactly right
+        size can sit under a name no local key matches. Verification was
+        always size-only (the API has no hash), so a unique same-size entry
+        counts as verified. Ambiguous (several entries of that size) or
+        absent -> failure, never a false positive."""
+        entry = listing.get(name_key(name))
+        if entry is not None:
+            return entry
+        matches = [e for e in listing.values()
+                   if not e.get("isFolder") and int(e.get("filesize", -1)) == size]
+        return matches[0] if len(matches) == 1 else None
+
     def verify(self) -> None:
         """Re-list every folder written to and check the sizes we uploaded."""
         for rel_dir, uploaded in self._uploaded.items():
@@ -349,7 +366,7 @@ class Mirror:
                 self.stats.failures.append((rel_dir or "/", f"verify listing failed: {exc}"))
                 continue
             for name, size, mtime in uploaded:
-                entry = listing.get(name_key(name))
+                entry = self._find_uploaded(listing, name, size)
                 target = f"{rel_dir}/{name}" if rel_dir else name
                 if entry is None:
                     self.stats.failures.append((target, "missing after upload"))
