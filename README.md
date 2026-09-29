@@ -11,7 +11,7 @@ Status: **pre-1.0, working and in daily use** for scheduled backups of ~150 GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
 verification, idempotent re-runs, trash/restore, version history, batch delete,
 move/rename, download resume).
-131 unit tests.
+156 unit tests.
 
 ## Why this exists
 
@@ -476,7 +476,7 @@ folder per call and never batches listings.
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 131 tests, no dependencies
+python -m unittest discover -s tests     # 156 tests, no dependencies
 ```
 
 CI (`.github/workflows/tests.yml`) runs exactly that on every push and pull
@@ -484,7 +484,7 @@ request, against Python 3.11, 3.12 and 3.13. The same workflow builds the
 packages, and so can you:
 
 ```bash
-python -m build        # writes dist/coldsnake-0.1.3.tar.gz and .whl
+python -m build        # writes dist/coldsnake-0.1.4.tar.gz and .whl
 ```
 
 Publication to PyPI is **not** automated: releases are built and uploaded by
