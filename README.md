@@ -35,6 +35,15 @@ coldsnake --version
 
 Python **3.11+** (uses `tomllib`), standard library only.
 
+### Two-factor auth
+
+Accounts with 2FA: set `twofa = true` under `[auth]`. A login then answers
+`code 6000` (userId + method) and ColdSnake confirms via `2fa-gauth-verify`
+(Google Authenticator) or `2fa-sms-confirm-code`; the code comes from the
+`ICEDRIVE_2FA_CODE` env var, or a prompt on a tty. Note the cached bearer token
+keeps daily runs working, but an unattended re-login needs a fresh code --
+scheduled runs on a 2FA account must supply `ICEDRIVE_2FA_CODE`.
+
 Running from a checkout without installing:
 
 ```bash
