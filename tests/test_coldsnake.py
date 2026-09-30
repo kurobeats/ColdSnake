@@ -100,7 +100,7 @@ class TwofaTests(unittest.TestCase):
 
     CHALLENGE = {"challenge": base64.urlsafe_b64encode(b"seed").decode().rstrip("="),
                  "token": "tok", "exp": 1, "difficultyBits": 12, "scope": "login"}
-    NEEDS_2FA = {"code": 6000, "error": 1,
+    NEEDS_2FA = {"code": 6000, "error": 1, "userId": 742146, "method": "gauth",
                  "message": "Two Factor Authentication Required"}
 
     def client_with(self, responses, twofa):
@@ -128,17 +128,24 @@ class TwofaTests(unittest.TestCase):
             result = client.login()
         self.assertEqual(result["token"], "tok2")
         self.assertEqual(client.token, "tok2")
-        confirm = requests[2]                       # first confirm attempt worked
+        confirm = requests[2]                       # single live-verified form
         self.assertEqual(confirm["request"], ["2fa-gauth-verify"])
+        self.assertEqual(confirm["userId"], ["742146"])
         self.assertEqual(confirm["gauth"], ["123456"])
 
     def test_twofa_on_all_rejects_is_auth_error(self):
-        client, _ = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
-                                      {"code": 2200, "error": 1, "message": "bad"}],
-                                     twofa=True)
+        client, requests = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
+                                             {"code": 2200, "error": 1, "message": "bad"}],
+                                            twofa=True)
+        # check_payload's error-document stash would leak across clients/tests;
+        # the login POST must present a fresh 6000 each time.
+        import coldsnake.client as m
+        m._LAST_API_ERROR = None
         with mock.patch.dict(os.environ, {"ICEDRIVE_2FA_CODE": "123456"}):
             with self.assertRaises(AuthError):
                 client.login()
+        # one confirm attempt, exactly the live-verified shape
+        self.assertEqual(len(requests), 3)
 
 
 class ChunkingTests(unittest.TestCase):
