@@ -275,15 +275,18 @@ class Client:
             "password": self.password, "pow_proof": proof, "request": "login",
             "email": self.email, "no_token_check": "true", "app": "ios",
         })
-        result = self._retry(
-            lambda: self._request(API + "/api", body, content_type, "POST", auth=False), auth=False)
-        if not isinstance(result, dict) or not result.get("token"):
-            # Login rejected without a token. With 2FA off that is fatal (bad
-            # credentials); with 2FA on it is presumably the 2FA challenge, so
-            # take a confirm code and retry the second step.
-            if not self.twofa:
-                raise AuthError(f"login failed: {json.dumps(result)[:200]}")
-            result = self._confirm_twofa(result)
+        try:
+            result = self._retry(
+                lambda: self._request(API + "/api", body, content_type, "POST", auth=False), auth=False)
+        except IcedriveError as exc:
+            # Live-verified 2026-09-30: an account with 2FA answers the login
+            # POST with {"code": 6000, "message": "Two Factor Authentication
+            # Required"} and check_payload raises before login() sees the dict.
+            # Without the toggle that stays fatal; with it, move to the confirm
+            # step.
+            if not (self.twofa and "Two Factor Authentication Required" in str(exc)):
+                raise
+            result = self._confirm_twofa()
         if not isinstance(result, dict) or not result.get("token"):
             raise AuthError(f"login failed: {json.dumps(result)[:200]}")
         self.token = result["token"]
@@ -300,15 +303,16 @@ class Client:
                      f"(plan {auth.get('plan')}, id {auth.get('id')})")
         return result
 
-    def _confirm_twofa(self, challenge: dict) -> dict:
+    def _confirm_twofa(self) -> dict:
         """Second login step for accounts with 2FA enabled.
 
         ponytail: wire layout NOT verified (IcedriveCLI_v3.62 static strings
         only -- request names 2fa-gauth-verify / gauthconfirm /
         2fa-sms-confirm-code / smsconfirm, fields gauth/sms, exact field names
         and response shape unknown). All name/field combinations are tried and
-        the first token wins; adjust this method to the one live-verified form
-        after the first 2FA test run.
+        the first token wins; rejections are error documents (check_payload
+        raises), so each attempt must catch IcedriveError. Collapse this method
+        to the one live-verified form after the first successful test.
         """
         code = os.environ.get("ICEDRIVE_2FA_CODE")
         if not code and sys.stdin.isatty():
@@ -317,16 +321,20 @@ class Client:
             raise AuthError("2FA required: set ICEDRIVE_2FA_CODE or run interactively")
         attempts = [("2fa-gauth-verify", "gauth"), ("gauthconfirm", "gauth"),
                     ("2fa-sms-confirm-code", "sms"), ("smsconfirm", "sms")]
-        last = challenge
+        problems = []
         for request, field in attempts:
             body, content_type = _urlencode({"app": "ios", "request": request,
                                              field: code, "code": code})
-            last = self._retry(
-                lambda: self._request(API + "/api", body, content_type, "POST", auth=False),
-                auth=False)
-            if isinstance(last, dict) and last.get("token"):
-                return last
-        raise AuthError(f"2FA confirm failed: {json.dumps(last)[:200]}")
+            try:
+                result = self._retry(
+                    lambda: self._request(API + "/api", body, content_type, "POST", auth=False),
+                    auth=False)
+                if isinstance(result, dict) and result.get("token"):
+                    return result
+                problems.append(json.dumps(result)[:120])
+            except IcedriveError as exc:
+                problems.append(str(exc))
+        raise AuthError(f"2FA confirm failed: {'; '.join(problems)}")
 
     def probe(self) -> dict:
         """Single-attempt health check: raises TransientError while the service is
