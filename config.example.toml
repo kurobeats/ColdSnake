@@ -6,6 +6,9 @@
 [auth]
 email = "you@example.com"
 # password = ""
+# Set twofa = true when the account has two-factor auth enabled; the confirm
+# code is read from the ICEDRIVE_2FA_CODE env var (or a prompt on a tty).
+# twofa = false
 
 # One [[mirror]] block per local directory you want mirrored.
 [[mirror]]
