@@ -94,11 +94,14 @@ class ProofOfWorkTests(unittest.TestCase):
 
 
 class TwofaTests(unittest.TestCase):
-    """Config toggle off keeps behaviour; on, the login rejection is followed
-    by a second-step confirm request."""
+    """Live-verified rejection shape: login answers
+    {"code": 6000, "message": "Two Factor Authentication Required"}, which
+    check_payload raises as IcedriveError before login() sees the dict."""
 
     CHALLENGE = {"challenge": base64.urlsafe_b64encode(b"seed").decode().rstrip("="),
                  "token": "tok", "exp": 1, "difficultyBits": 12, "scope": "login"}
+    NEEDS_2FA = {"code": 6000, "error": 1,
+                 "message": "Two Factor Authentication Required"}
 
     def client_with(self, responses, twofa):
         client = Client("e@example.com", "pw", twofa=twofa)
@@ -106,19 +109,19 @@ class TwofaTests(unittest.TestCase):
 
         def fake_request(url, body=None, content_type=None, method="GET", auth=True):
             requests.append(urllib.parse.parse_qs(body.decode()))
-            return responses[min(len(requests), len(responses)) - 1]
+            return check_payload(responses[min(len(requests), len(responses)) - 1])
 
         client._request = fake_request
         return client, requests
 
     def test_twofa_off_login_fails_as_before(self):
-        client, requests = self.client_with([self.CHALLENGE, {"code": 2400}], twofa=False)
-        with self.assertRaises(AuthError):
+        client, requests = self.client_with([self.CHALLENGE, self.NEEDS_2FA], twofa=False)
+        with self.assertRaises(IcedriveError):
             client.login()
         self.assertEqual(len(requests), 2)          # only pow-new + login
 
     def test_twofa_on_confirms_and_returns_token(self):
-        client, requests = self.client_with([self.CHALLENGE, {"code": 2400},
+        client, requests = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
                                              {"token": "tok2", "auth_data": {"id": 1}}],
                                             twofa=True)
         with mock.patch.dict(os.environ, {"ICEDRIVE_2FA_CODE": "123456"}):
@@ -130,7 +133,8 @@ class TwofaTests(unittest.TestCase):
         self.assertEqual(confirm["gauth"], ["123456"])
 
     def test_twofa_on_all_rejects_is_auth_error(self):
-        client, _ = self.client_with([self.CHALLENGE, {"code": 2400}, {"code": 2200}],
+        client, _ = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
+                                      {"code": 2200, "error": 1, "message": "bad"}],
                                      twofa=True)
         with mock.patch.dict(os.environ, {"ICEDRIVE_2FA_CODE": "123456"}):
             with self.assertRaises(AuthError):
