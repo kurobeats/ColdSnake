@@ -22,3 +22,9 @@ remote = "Pictures"
 # Optional: skip files/dirs matching these globs (same as --exclude, repeatable
 # globs in a list). Matched against the relative path and the file name.
 exclude = ["*.tmp", ".stfolder/*", ".stversions/*"]
+
+# Optional: webhook notifications. One POST (JSON) to this URL when a
+# mirror/check run starts and one when it finishes. The finished payload
+# carries ok, error (auth/service/pre-flight/other), and every failed file.
+[webhook]
+# url = "https://example.com/hook/coldsnake"

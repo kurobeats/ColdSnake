@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import tomllib
+import urllib.request
 
 from . import __version__
 from .client import AuthError, Client, IcedriveError, TransientError
@@ -30,10 +31,11 @@ class Report:
     an abort (exit 2/3) emits one complete object instead of a half document.
     """
 
-    def __init__(self, command: str, to_stdout: bool, path: str | None):
+    def __init__(self, command: str, to_stdout: bool, path: str | None, event: str = "finished"):
         self.command = command
         self.to_stdout = to_stdout
         self.path = path
+        self.event = event
         self.started = time.strftime("%Y-%m-%dT%H:%M:%S")
         self._start = time.time()
         self.ok = True
@@ -43,7 +45,7 @@ class Report:
         self.mirrors: list[dict] = []
 
     def document(self) -> dict:
-        doc = {"command": self.command, "version": __version__, "started": self.started,
+        doc = {"event": self.event, "command": self.command, "version": __version__, "started": self.started,
                "finished": time.strftime("%Y-%m-%dT%H:%M:%S"),
                "duration_s": round(time.time() - self._start, 1),
                "ok": self.ok, "failures": self.failures}
@@ -81,6 +83,29 @@ def mirror_document(local: str, remote: str, stats) -> dict:
             "trashed": stats.trashed, "deleted": stats.deleted, "failed": stats.failed(),
             "failures": [{"path": path, "error": str(error)[:200]}
                          for path, error in stats.failures]}
+
+
+def post_webhook(url: str, payload: dict) -> None:
+    """POST one JSON webhook. A failed notification must never fail the run:
+    the run's own log/report carries the truth, the webhook is a convenience."""
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as exc:                        # noqa: BLE001 - notification is best-effort
+        log(f"warning: webhook delivery failed: {str(exc)[:200]}")
+
+
+def fire_webhook(url: str | None, report: Report | None, event: str, extra: dict | None = None) -> None:
+    if not url or report is None:
+        return
+    payload = report.document()
+    payload["event"] = event
+    if extra:
+        payload.update(extra)
+    post_webhook(url, payload)
 
 
 DEFAULT_CONFIG = os.path.expanduser("~/.config/coldsnake/config.toml")
@@ -331,12 +356,25 @@ def main(argv: list[str] | None = None) -> int:
     global _LOG_ON_STDERR
     json_flag = getattr(args, "json", False)
     report_path = getattr(args, "report", None)
+
+    # Webhook: [webhook] url in the config. One POST on run start, one on run
+    # finish; the finished document already carries ok/error/failures, which is
+    # every error type and every file failure in one place. Config parse errors
+    # must not crash argparse time, so a bad config just disables webhooks.
+    try:
+        pre_config = load_config(args.config)
+    except PreflightError:
+        pre_config = {}
+    webhook_url = pre_config.get("webhook", {}).get("url")
     report = (Report(args.command, to_stdout=json_flag, path=report_path)
-              if args.command in ("mirror", "check") and (json_flag or report_path) else None)
+              if args.command in ("mirror", "check") and
+              (json_flag or report_path or webhook_url) else None)
     _LOG_ON_STDERR = bool(json_flag)
 
     try:
         config = load_config(args.config)
+        if args.command in ("mirror", "check"):
+            fire_webhook(webhook_url, report, "started", {"ok": True, "failures": 0})
         if args.command == "login":
             client = build_client(args, config)
             log("login ok")
@@ -633,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         # One emit point: an abort on any path above still writes the whole document.
         if report is not None:
+            fire_webhook(webhook_url, report, "finished")
             report.emit()
 
 

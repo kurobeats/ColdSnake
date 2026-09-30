@@ -117,6 +117,28 @@ remote = "Pictures"
 `remote` is a folder name created at the **root of your Icedrive** if it does not
 exist; the local tree is mirrored inside it.
 
+### Webhook notifications
+
+Optional. Add to the config:
+
+```toml
+[webhook]
+url = "https://your-endpoint/hook/coldsnake"
+```
+
+One JSON POST when a `mirror`/`check` run starts, and one when it finishes. The
+finished payload carries `ok`, `error` (any abort: auth, service outage,
+pre-flight refusal, unexpected error), the exit-code stats, and every failed
+file under `mirrors[].failures`: `{path, error}`. Example:
+
+```json
+{"event": "finished", "command": "mirror", "ok": false, "failures": 1,
+ "mirrors": [{"remote": "Sync", "failures": [{"path": "a.txt", "error": "boom"}]}]}
+```
+
+Delivery is best-effort with a 10s timeout: a webhook that fails to send logs a
+warning and never changes the run's exit code.
+
 ## Usage
 
 ```bash
