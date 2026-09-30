@@ -142,9 +142,11 @@ def resolve_credentials(config: dict) -> tuple[str, str]:
 
 def build_client(args, config, use_cache: bool = True, journal=None) -> Client:
     """Cached bearer token when possible, otherwise proof-of-work login."""
+    auth = config.get("auth", {})
     email, password = resolve_credentials(config)
     client = Client(email, password, verbose=args.verbose,
-                    device_id=resolve_device_id(config), log=log, journal=journal)
+                    device_id=resolve_device_id(config), log=log, journal=journal,
+                    twofa=bool(auth.get("twofa", False)))
     if use_cache and not getattr(args, "no_token_cache", False):
         client._token_path = TOKEN_CACHE
         if client.load_token(TOKEN_CACHE):

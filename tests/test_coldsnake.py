@@ -1,4 +1,5 @@
 """Tests for the pure logic: proof-of-work grading and mirror decisions."""
+import urllib.parse
 import base64
 import hashlib
 import http.server
@@ -90,6 +91,50 @@ class ProofOfWorkTests(unittest.TestCase):
         self.assertGreaterEqual(leading_zero_bits(digest), 12)
         self.assertEqual(digest.hex(), proof["hash"])
         self.assertEqual(proof["ver"], "1")
+
+
+class TwofaTests(unittest.TestCase):
+    """Config toggle off keeps behaviour; on, the login rejection is followed
+    by a second-step confirm request."""
+
+    CHALLENGE = {"challenge": base64.urlsafe_b64encode(b"seed").decode().rstrip("="),
+                 "token": "tok", "exp": 1, "difficultyBits": 12, "scope": "login"}
+
+    def client_with(self, responses, twofa):
+        client = Client("e@example.com", "pw", twofa=twofa)
+        requests = []
+
+        def fake_request(url, body=None, content_type=None, method="GET", auth=True):
+            requests.append(urllib.parse.parse_qs(body.decode()))
+            return responses[min(len(requests), len(responses)) - 1]
+
+        client._request = fake_request
+        return client, requests
+
+    def test_twofa_off_login_fails_as_before(self):
+        client, requests = self.client_with([self.CHALLENGE, {"code": 2400}], twofa=False)
+        with self.assertRaises(AuthError):
+            client.login()
+        self.assertEqual(len(requests), 2)          # only pow-new + login
+
+    def test_twofa_on_confirms_and_returns_token(self):
+        client, requests = self.client_with([self.CHALLENGE, {"code": 2400},
+                                             {"token": "tok2", "auth_data": {"id": 1}}],
+                                            twofa=True)
+        with mock.patch.dict(os.environ, {"ICEDRIVE_2FA_CODE": "123456"}):
+            result = client.login()
+        self.assertEqual(result["token"], "tok2")
+        self.assertEqual(client.token, "tok2")
+        confirm = requests[2]                       # first confirm attempt worked
+        self.assertEqual(confirm["request"], ["2fa-gauth-verify"])
+        self.assertEqual(confirm["gauth"], ["123456"])
+
+    def test_twofa_on_all_rejects_is_auth_error(self):
+        client, _ = self.client_with([self.CHALLENGE, {"code": 2400}, {"code": 2200}],
+                                     twofa=True)
+        with mock.patch.dict(os.environ, {"ICEDRIVE_2FA_CODE": "123456"}):
+            with self.assertRaises(AuthError):
+                client.login()
 
 
 class ChunkingTests(unittest.TestCase):
