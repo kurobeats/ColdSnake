@@ -85,12 +85,50 @@ def mirror_document(local: str, remote: str, stats) -> dict:
                          for path, error in stats.failures]}
 
 
+def discord_payload(payload: dict) -> dict:
+    """Flatten a run report into one Discord embed (25-field/6000-char caps).
+
+    Discord webhooks refuse a body without content/embeds, so the raw report
+    document cannot be posted as-is.
+    """
+    ok = bool(payload.get("ok"))
+    fields = []
+    if payload.get("error"):
+        fields.append({"name": "error", "value": str(payload["error"])[:1024], "inline": False})
+    lines = []
+    for mirror in payload.get("mirrors", []):
+        for failure in mirror.get("failures", []):
+            lines.append(f"{mirror.get('remote')}/{failure['path']} — {failure['error']}")
+    if lines:
+        joined = "\n".join(lines)
+        if len(joined) > 1000:
+            joined = joined[:1000] + f"\n… (+{len(lines)} failures total)"
+        fields.append({"name": f"file failures ({len(lines)})", "value": joined, "inline": False})
+    for key in ("failures", "uploaded", "unchanged", "verified", "duration_s"):
+        if key in payload:
+            fields.append({"name": key, "value": str(payload[key])[:1024], "inline": True})
+    return {"embeds": [{
+        "title": f"ColdSnake {payload.get('event', '?')}: "
+                 f"{payload.get("command", "?")} {'ok' if ok else 'FAILED'}",
+        "color": 0x2ecc71 if ok else 0xe74c3c,
+        "description": f"{payload.get("command", "?")} run "
+                       f"{payload.get("started", "?")} → {payload.get("finished", "?")}",
+        "fields": fields[:25],
+    }]}
+
+
 def post_webhook(url: str, payload: dict) -> None:
     """POST one JSON webhook. A failed notification must never fail the run:
-    the run's own log/report carries the truth, the webhook is a convenience."""
+    the run's own log/report carries the truth, the webhook is a convenience.
+    Discord webhook URLs get the report flattened into an embed."""
     try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"},
+        if "discord.com/api/webhooks" in url:
+            body = discord_payload(payload)
+        else:
+            body = payload
+        req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "coldsnake/" + __version__},  # Discord 403s the default Python UA
                                      method="POST")
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()

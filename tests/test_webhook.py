@@ -121,3 +121,24 @@ class Webhook(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DiscordPayload(unittest.TestCase):
+    def test_shape(self):
+        payload = {"event": "finished", "command": "mirror", "ok": False, "failures": 1,
+                   "started": "s", "finished": "f", "error": "service down",
+                   "mirrors": [{"remote": "R", "failures": [{"path": "a.txt", "error": "boom"}]}]}
+        body = cli.discord_payload(payload)
+        embed = body["embeds"][0]
+        self.assertIn("FAILED", embed["title"])
+        self.assertEqual(embed["color"], 0xe74c3c)
+        names = [f["name"] for f in embed["fields"]]
+        self.assertIn("R/a.txt", embed["fields"][-2]["value"])
+        self.assertIn("error", names)
+        self.assertIn("file failures (1)", names)
+
+    def test_caps(self):
+        payload = {"event": "finished", "ok": False, "mirrors": [
+            {"remote": "R", "failures": [{"path": f"f{i}", "error": "x"} for i in range(500)]}]}
+        embed = cli.discord_payload(payload)["embeds"][0]
+        self.assertEqual(len(embed["fields"]), 1)         # all 500 collapse into one field
+        self.assertLessEqual(len(embed["fields"][0]["value"]), 1024)
