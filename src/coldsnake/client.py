@@ -33,10 +33,11 @@ import urllib.request
 import uuid
 
 API = "https://apis.icedrive.net/v3/mobile"
-# Match a real shipped client. The v3.62 Linux CLI is the closest identity for a
-# headless mirror (static strings: ICEDRIVECLI_V3.62_API.md). If the server
-# balks, revert to the previous "icedrive-ios/2.3.1".
-USER_AGENT = "icedrive-linux-cli/3.62"
+USER_AGENT = "icedrive-ios/2.3.1"
+# ponytail: tried matching the CLI UA (icedrive-linux-cli/3.62) per
+# ICEDRIVECLI_V3.62 static docs; the live server answers 403 Forbidden for any
+# linux-cli UA on apis.icedrive.net/v3/mobile (verified 2026-09-30). The CLI
+# evidently uses another host. Retry the swap only after finding that host.
 # Socket timeouts are inactivity timeouts: as long as bytes flow, a large upload
 # is fine. They are deliberately short so a stalled server surfaces as a retryable
 # failure instead of hanging the run.
