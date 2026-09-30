@@ -56,6 +56,12 @@ class IcedriveError(RuntimeError):
     """Any unrecoverable API failure."""
 
 
+# Last error document seen by check_payload. The 2FA login flow reads userId
+# and method out of the code-6000 rejection, which check_payload raises before
+# login() can return the dict.
+_LAST_API_ERROR: dict | None = None
+
+
 class AuthError(IcedriveError):
     """Credentials rejected."""
 
@@ -100,7 +106,9 @@ def name_key(name: str) -> str:
 
 def check_payload(data):
     """Raise if an API response body is an error document."""
+    global _LAST_API_ERROR
     if isinstance(data, dict) and data.get("error"):
+        _LAST_API_ERROR = data
         code = data.get("code")
         message = data.get("message") or "unknown error"
         if code in AUTH_ERROR_CODES:
@@ -286,7 +294,7 @@ class Client:
             # step.
             if not (self.twofa and "Two Factor Authentication Required" in str(exc)):
                 raise
-            result = self._confirm_twofa()
+            result = self._confirm_twofa(_LAST_API_ERROR or {})
         if not isinstance(result, dict) or not result.get("token"):
             raise AuthError(f"login failed: {json.dumps(result)[:200]}")
         self.token = result["token"]
@@ -303,38 +311,38 @@ class Client:
                      f"(plan {auth.get('plan')}, id {auth.get('id')})")
         return result
 
-    def _confirm_twofa(self) -> dict:
+    def _confirm_twofa(self, challenge: dict) -> dict:
         """Second login step for accounts with 2FA enabled.
 
-        ponytail: wire layout NOT verified (IcedriveCLI_v3.62 static strings
-        only -- request names 2fa-gauth-verify / gauthconfirm /
-        2fa-sms-confirm-code / smsconfirm, fields gauth/sms, exact field names
-        and response shape unknown). All name/field combinations are tried and
-        the first token wins; rejections are error documents (check_payload
-        raises), so each attempt must catch IcedriveError. Collapse this method
-        to the one live-verified form after the first successful test.
+        Live-verified on phalanx 2026-09-30: the login POST answers
+        {"code": 6000, "message": "Two Factor Authentication Required",
+        "userId": <id>, "method": "gauth"}; the confirm request is POST /api
+        {request: 2fa-gauth-verify (gauth, from the CLI client) or
+        2fa-sms-confirm-code, app, userId, gauth|sms: code, code: code}.
+        gauthconfirm/smsconfirm are CLI-foreign names (2003 Invalid request) and
+        without userId the 2fa-* requests answer 2001 Missing data. The one
+        unverified detail is whether a successful confirm returns a token
+        directly - collapse this if the server hands something different.
         """
         code = os.environ.get("ICEDRIVE_2FA_CODE")
         if not code and sys.stdin.isatty():
             code = input("2FA code: ").strip()
         if not code:
             raise AuthError("2FA required: set ICEDRIVE_2FA_CODE or run interactively")
-        attempts = [("2fa-gauth-verify", "gauth"), ("gauthconfirm", "gauth"),
-                    ("2fa-sms-confirm-code", "sms"), ("smsconfirm", "sms")]
-        problems = []
-        for request, field in attempts:
-            body, content_type = _urlencode({"app": "ios", "request": request,
-                                             field: code, "code": code})
-            try:
-                result = self._retry(
-                    lambda: self._request(API + "/api", body, content_type, "POST", auth=False),
-                    auth=False)
-                if isinstance(result, dict) and result.get("token"):
-                    return result
-                problems.append(json.dumps(result)[:120])
-            except (IcedriveError, urllib.error.HTTPError) as exc:
-                problems.append(str(exc))
-        raise AuthError(f"2FA confirm failed: {'; '.join(problems)}")
+        field = "sms" if challenge.get("method") == "sms" else "gauth"
+        request = "2fa-sms-confirm-code" if field == "sms" else "2fa-gauth-verify"
+        body, content_type = _urlencode({"app": "ios", "request": request,
+                                         "userId": str(challenge.get("userId", "")),
+                                         field: code, "code": code})
+        try:
+            result = self._retry(
+                lambda: self._request(API + "/api", body, content_type, "POST", auth=False),
+                auth=False)
+        except (IcedriveError, urllib.error.HTTPError) as exc:
+            raise AuthError(f"2FA confirm failed: {exc}") from exc
+        if isinstance(result, dict) and result.get("token"):
+            return result
+        raise AuthError(f"2FA confirm failed: {json.dumps(result)[:200]}")
 
     def probe(self) -> dict:
         """Single-attempt health check: raises TransientError while the service is
