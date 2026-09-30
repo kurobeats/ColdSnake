@@ -332,7 +332,7 @@ class Client:
                 if isinstance(result, dict) and result.get("token"):
                     return result
                 problems.append(json.dumps(result)[:120])
-            except IcedriveError as exc:
+            except (IcedriveError, urllib.error.HTTPError) as exc:
                 problems.append(str(exc))
         raise AuthError(f"2FA confirm failed: {'; '.join(problems)}")
 
