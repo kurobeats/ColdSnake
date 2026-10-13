@@ -96,12 +96,18 @@ def upload_id_for(folder_id: int, path: str, size: int, mtime: int) -> str:
     return hashlib.sha1(seed.encode()).hexdigest()
 
 
+_SERVER_STRIPPED = '<>:"/\\|?'
+
 def name_key(name: str) -> str:
-    """How the server compares item names: seen live, it collapsed a folder
-    named 'Example Album！' (fullwidth U+FF01) onto the ASCII 'Example
-    Album!' and refused a second create with 2006. NFKC is the rule that
-    reproduces that collapse; compare names through it."""
-    return unicodedata.normalize("NFKC", name)
+    """How the server compares item names. Seen live (test-account 2026-10-13):
+    it NFKC-collapses a fullwidth '！' onto ASCII '!'; it is case-insensitive
+    (remote 'ARTIST' swallowed a local 'Artist' with 2006); and folder-create
+    strips '< > : " / \\ | ?' (the Windows-forbidden set minus '*'), storing
+    '1 a:b' as '1 ab' with no space collapsing. Match remote names through
+    the same rule, or folders that exist under a stripped/case-different name
+    are "missing" from listings and re-created (2006) forever. """
+    return unicodedata.normalize("NFKC", "".join(
+        ch for ch in name if ch not in _SERVER_STRIPPED)).casefold()
 
 
 def check_payload(data):

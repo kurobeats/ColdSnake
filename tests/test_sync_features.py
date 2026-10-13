@@ -229,9 +229,26 @@ class EmptyFileTests(unittest.TestCase):
 
 
 class NameNormalizationTests(unittest.TestCase):
-    """The server normalizes item names (NFKC): a fullwidth '！' exists as the
-    ASCII '!'. Mirror matching must go through the same rule, or folders that
-    already exist are re-created (2006) and the mirror aborts."""
+    """The server normalizes item names (NFKC) and is case-insensitive: a fullwidth
+    '！' exists as the ASCII '!'; remote 'ARTIST' swallows a local 'Artist'
+    (test-account 2026-10-13). Mirror matching must go through the same rule, or
+    folders that already exist are re-created (2006) and the mirror aborts."""
+    def test_folder_id_reuses_stripped_existing_folder(self):
+        client = FakeClient()
+        existing = {"id": 99, "filename": "Example Title (Deluxe Edition)", "isFolder": 1}
+        client.tree[0] = [{"id": 5, "filename": "Remote", "isFolder": 1}]
+        client.tree[5] = [existing]
+        mirror = Mirror(client, "/tmp", "Remote")
+        rel = "Example: Title (Deluxe Edition)"
+        self.assertEqual(mirror.folder_id(rel), 99)        # no create attempted
+
+    def test_folder_id_reuses_casefolded_existing_folder(self):
+        client = FakeClient()
+        existing = {"id": 99, "filename": "ARTIST", "isFolder": 1}
+        client.tree[0] = [{"id": 5, "filename": "Remote", "isFolder": 1}]
+        client.tree[5] = [existing]
+        mirror = Mirror(client, "/tmp", "Remote")
+        self.assertEqual(mirror.folder_id("Artist"), 99)  # no create attempted
 
     def test_folder_id_reuses_normalized_existing_folder(self):
         client = FakeClient()
