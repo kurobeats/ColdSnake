@@ -250,6 +250,17 @@ class NameNormalizationTests(unittest.TestCase):
         mirror = Mirror(client, "/tmp", "Remote")
         self.assertEqual(mirror.folder_id("Artist"), 99)  # no create attempted
 
+    def test_folder_id_reuses_existing_folder_whose_leading_space_was_stripped(self):
+        """Live: folder-create stored a local ' Leading Space' as 'Leading Space'.
+        Without stripping in name_key that folder read as missing, so the music
+        scrub reported 10 files in it as gone (test-account 2026-10-22)."""
+        client = FakeClient()
+        existing = {"id": 99, "filename": "Leading Space", "isFolder": 1}
+        client.tree[0] = [{"id": 5, "filename": "Remote", "isFolder": 1}]
+        client.tree[5] = [existing]
+        mirror = Mirror(client, "/tmp", "Remote")
+        self.assertEqual(mirror.folder_id(" Leading Space"), 99)
+
     def test_folder_id_reuses_normalized_existing_folder(self):
         client = FakeClient()
         existing = {"id": 99, "filename": "Example Album!", "isFolder": 1}

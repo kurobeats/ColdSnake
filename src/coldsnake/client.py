@@ -44,6 +44,12 @@ USER_AGENT = "icedrive-ios/2.3.1"
 CONTROL_TIMEOUT = 60
 UPLOAD_TIMEOUT = 120
 STREAM_CHUNK = 1024 * 1024
+# Measured 2026-10-22 on the live account (tools/throttle_probe.py): two listing
+# streams held 1.39 calls/s for 10 min and 2.08 calls/s for 3 min with no 429 and
+# flat ~0.42 s latency; 4.1 calls/s and 6.7 calls/s both answered 429 with
+# Retry-After: 90 and needed ~91 s to recover. So 1.5 calls/s is the fastest rate
+# proven safe with headroom - anything above the knee costs a 90 s stall.
+CONTROL_MIN_INTERVAL = 0.67
 # Files larger than this are uploaded as ranged chunks (verified against the API:
 # chunks are keyed by unique_upload_id, idempotent when re-sent, and a different
 # id cannot resume a partial upload). A stall therefore costs one chunk, not the
@@ -103,11 +109,13 @@ def name_key(name: str) -> str:
     it NFKC-collapses a fullwidth '！' onto ASCII '!'; it is case-insensitive
     (remote 'ARTIST' swallowed a local 'Artist' with 2006); and folder-create
     strips '< > : " / \\ | ?' (the Windows-forbidden set minus '*'), storing
-    '1 a:b' as '1 ab' with no space collapsing. Match remote names through
-    the same rule, or folders that exist under a stripped/case-different name
-    are "missing" from listings and re-created (2006) forever. """
+    '1 a:b' as '1 ab' with no space collapsing, while a **leading space is
+    stripped** (' Leading Space' is stored as 'Leading Space', verified live
+    2026-10-22). Match remote names through the same rule, or folders that
+    exist under a stripped/case-different name are "missing" from listings and
+    re-created (2006) forever. """
     return unicodedata.normalize("NFKC", "".join(
-        ch for ch in name if ch not in _SERVER_STRIPPED)).casefold()
+        ch for ch in name if ch not in _SERVER_STRIPPED)).strip().casefold()
 
 
 def check_payload(data):
@@ -184,10 +192,15 @@ class Client:
                  timeout: int = CONTROL_TIMEOUT, upload_timeout: int = UPLOAD_TIMEOUT,
                  retries: int = 3, device_id: str | None = None,
                  chunk_size: int = DEFAULT_CHUNK_SIZE, log=print,
-                 journal: "UploadJournal | None" = None, twofa: bool = False):
+                 journal: "UploadJournal | None" = None, twofa: bool = False,
+                 control_interval: float = CONTROL_MIN_INTERVAL):
         self.email = email
         self.password = password
         self.twofa = twofa
+        # Minimum spacing between listing calls, learned from the throttle probe.
+        # 0 disables pacing (the probe itself wants the raw transport).
+        self.control_interval = control_interval
+        self._last_control = 0.0
         self.verbose = verbose
         self.timeout = timeout
         self.upload_timeout = upload_timeout
@@ -267,6 +280,8 @@ class Client:
                     # 1-4s). Honor Retry-After, else wait a full minute.
                     retry_after = (exc.headers or {}).get("Retry-After", "")
                     wait = min(int(retry_after), 300) if retry_after.isdigit() else 60
+                    if self.control_interval:            # pace slower for the rest of the run
+                        self.control_interval = min(5.0, self.control_interval * 1.5)
             except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
                 last, transient = exc, True
             if attempt < self.retries:
@@ -413,7 +428,19 @@ class Client:
 
     # --- folders ---------------------------------------------------------
     def listing(self, folder_id: int = 0) -> list[dict]:
+        self._pace()
         return self.call(f"/collection?type=cloud&folderId={folder_id}").get("data", [])
+
+    def _pace(self) -> None:
+        """Space listing calls out. The API 429s above ~2-4/s, and a 429 costs a
+        90 s Retry-After stall, so a scrub that lists thousands of folders must not
+        discover the limit by hitting it."""
+        if not self.control_interval:
+            return
+        wait = self._last_control + self.control_interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_control = time.monotonic()
 
     def create_folder(self, parent_id: int, name: str) -> int | None:
         body, content_type = _multipart({"request": "folder-create", "type": "folder-create",
