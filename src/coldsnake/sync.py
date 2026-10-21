@@ -131,12 +131,16 @@ class Mirror:
                 self.log(f"  {name!r} uses the existing folder {existing['filename']!r} "
                          f"(the server normalizes names)")
             self._folder_ids[rel] = existing["id"]
+            if self.db:
+                self.db.put_folder_id(self.remote, rel, existing["id"])
             return existing["id"]
         if self.dry_run:
             self.log(f"  would create remote folder {name if rel == '' else self.remote + '/' + rel}")
             self._folder_ids[rel] = -1
             return -1
         self._folder_ids[rel] = self.client.ensure_folder(parent_id, name)
+        if self.db:
+            self.db.put_folder_id(self.remote, rel, self._folder_ids[rel])
         parent_rel = os.path.dirname(rel)
         self._listings.pop(parent_rel, None)
         return self._folder_ids[rel]

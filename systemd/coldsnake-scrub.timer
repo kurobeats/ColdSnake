@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly ColdSnake remote re-verification (scrub)
+
+[Timer]
+# Deliberately before the 05:00 mirror: the account throttle is shared, so the two
+# passes must not run at the same time.
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

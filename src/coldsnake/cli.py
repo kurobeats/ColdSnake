@@ -218,6 +218,14 @@ def build_client(args, config, use_cache: bool = True, journal=None) -> Client:
     return client
 
 
+def state_dir(args) -> str:
+    """Where the sync db and upload journal live: next to the config in use.
+
+    Following --config matters: pointing a test run at another config must not
+    write the production db, and it previously did."""
+    return os.path.dirname(os.path.abspath(args.config)) or "."
+
+
 def resolve_pairs(args, config: dict) -> list[tuple[str, str]]:
     """Pairs from --local/--remote, else from the config's [[mirror]] entries."""
     if getattr(args, "local", None):
@@ -359,6 +367,15 @@ def main(argv: list[str] | None = None) -> int:
     mirror.add_argument("--json", action="store_true",
                         help="emit one JSON summary on stdout (progress goes to stderr)")
     mirror.add_argument("--report", metavar="PATH", help="also write the JSON summary to PATH")
+
+    scrub = sub.add_parser("scrub", parents=[common],
+                           help="re-verify recorded uploads against the remote, oldest folder first")
+    scrub.add_argument("--folders", type=int, default=1500, metavar="N",
+                       help="folders to verify this run (default 1500, ~17 min at the measured safe rate)")
+    scrub.add_argument("--remote", help="only this mirror's remote folder name")
+    scrub.add_argument("--all", action="store_true", help="verify every folder (hours, 429-paced)")
+    scrub.add_argument("--json", action="store_true", help="emit one JSON summary on stdout")
+    scrub.add_argument("--report", metavar="PATH", help="also write the JSON summary to PATH")
 
     dl = sub.add_parser("download", parents=[common], help="download from Icedrive to a local directory")
     dl.add_argument("--remote", required=True, help="remote folder name (as in [[mirror]] remote)")
@@ -611,16 +628,58 @@ def main(argv: list[str] | None = None) -> int:
             log(f"renamed {args.file} -> {new_name}")
             return 0
 
+        if args.command == "scrub":
+            from .scrub import scrub_mirror                  # lazy: keeps `coldsnake --version` cheap
+            from .state import SyncDb
+
+            remotes = [remote for _, remote in parse_pairs(config)]
+            if args.remote:
+                remotes = [remote for remote in remotes if remote == args.remote]
+                if not remotes:
+                    raise PreflightError(f"no [[mirror]] uses remote {args.remote!r}")
+            db = SyncDb(os.path.join(state_dir(args), "sync-db.sqlite"))
+            client = build_client(args, config)
+            limit = None if args.all else args.folders
+            results = []
+            failures = 0
+            for remote in remotes:
+                try:
+                    stats = scrub_mirror(client, db, remote, limit, log=log)
+                except (TransientError, AuthError):
+                    raise
+                except Exception as exc:                    # noqa: BLE001 - one mirror must not stop the rest
+                    failures += 1
+                    log(f"{remote}: ABORTED: {str(exc)[:200]}")
+                    results.append({"remote": remote, "failures": [{"path": remote, "error": str(exc)[:200]}]})
+                    continue
+                log(f"{remote}: scrub checked {stats.folders} folder(s) / {stats.files} file(s), "
+                    f"{stats.ok} ok, requeued {stats.requeued}, "
+                    f"missing folders {stats.missing_folders}, failed {len(stats.failures)}")
+                failures += len(stats.failures)
+                results.append({"remote": remote, **stats.as_dict()})
+            document = {"event": "finished", "command": "scrub", "version": __version__,
+                        "ok": failures == 0, "failures": failures, "mirrors": results}
+            if args.json:
+                print(json.dumps(document), flush=True)
+            if args.report:
+                try:
+                    with open(args.report, "w") as handle:
+                        handle.write(json.dumps(document) + "\n")
+                except OSError as exc:                      # noqa: BLE001
+                    log(f"warning: could not write report {args.report}: {exc}")
+            log(f"done: {failures} failure(s)")
+            return 1 if failures else 0
+
         # mirror
         pairs = resolve_pairs(args, config)
         journal = None
         if not args.no_upload_journal:
             from .state import UploadJournal               # lazy: the CLI must not need state to import
-            journal = UploadJournal(os.path.join(os.path.dirname(DEFAULT_CONFIG), "upload-journal.json"))
+            journal = UploadJournal(os.path.join(state_dir(args), "upload-journal.json"))
         db = None
         if not args.no_sync_db:
             from .state import SyncDb
-            db = SyncDb(os.path.join(os.path.dirname(DEFAULT_CONFIG), "sync-db.sqlite"))
+            db = SyncDb(os.path.join(state_dir(args), "sync-db.sqlite"))
         client = build_client(args, config, journal=journal)
         excludes = list(args.exclude) + list(config.get("exclude", []))
 

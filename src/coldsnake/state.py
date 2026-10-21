@@ -23,7 +23,11 @@ class SyncDb:
 
     Best-effort like the journal: a missing, corrupt or unwritable db only
     costs remote-listing fallback, never data. Delete the file to force a full
-    remote comparison on the next run (that is the resync)."""
+    remote comparison on the next run (that is the resync).
+
+    Also holds the scrub bookkeeping: which folders were last compared against
+    the remote, and the resolved remote folder ids (verifying a folder should
+    cost one listing, not one per path component)."""
 
     def __init__(self, path: str | None):
         self._conn = None
@@ -35,6 +39,17 @@ class SyncDb:
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS synced "
                 "(remote TEXT, rel TEXT, size INTEGER, mtime INTEGER, PRIMARY KEY (remote, rel))")
+            # Last time a folder's remote listing was compared against `synced`.
+            # The scrub pass walks the oldest entries first, so coverage is a
+            # rotating full sweep rather than a random sample.
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS checked "
+                "(remote TEXT, dir TEXT, at INTEGER, PRIMARY KEY (remote, dir))")
+            # Remote folder ids, so verifying a folder costs one listing instead of
+            # one per path component.
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS folder_ids "
+                "(remote TEXT, rel TEXT, folder_id INTEGER, PRIMARY KEY (remote, rel))")
             self._conn.commit()
         except sqlite3.Error:
             self._conn = None
@@ -53,6 +68,48 @@ class SyncDb:
         self._conn.execute(
             "INSERT OR REPLACE INTO synced (remote, rel, size, mtime) VALUES (?,?,?,?)",
             (remote, rel, size, mtime))
+        self._conn.commit()
+
+    def delete(self, remote: str, rel: str) -> None:
+        """Forget a file so the next mirror run re-checks it against the remote."""
+        if self._conn is None:
+            return
+        self._conn.execute("DELETE FROM synced WHERE remote=? AND rel=?", (remote, rel))
+        self._conn.commit()
+
+    def rows(self, remote: str) -> list[tuple[str, int, int]]:
+        if self._conn is None:
+            return []
+        return [(str(rel), int(size), int(mtime)) for rel, size, mtime in self._conn.execute(
+            "SELECT rel, size, mtime FROM synced WHERE remote=?", (remote,))]
+
+    def checked_at(self, remote: str) -> dict[str, int]:
+        if self._conn is None:
+            return {}
+        return {str(directory): int(at) for directory, at in self._conn.execute(
+            "SELECT dir, at FROM checked WHERE remote=?", (remote,))}
+
+    def mark_checked(self, remote: str, directory: str, at: int) -> None:
+        if self._conn is None:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO checked (remote, dir, at) VALUES (?,?,?)",
+            (remote, directory, at))
+        self._conn.commit()
+
+    def folder_id(self, remote: str, rel: str) -> int | None:
+        if self._conn is None:
+            return None
+        row = self._conn.execute(
+            "SELECT folder_id FROM folder_ids WHERE remote=? AND rel=?", (remote, rel)).fetchone()
+        return int(row[0]) if row else None
+
+    def put_folder_id(self, remote: str, rel: str, folder_id: int) -> None:
+        if self._conn is None:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO folder_ids (remote, rel, folder_id) VALUES (?,?,?)",
+            (remote, rel, folder_id))
         self._conn.commit()
 
 

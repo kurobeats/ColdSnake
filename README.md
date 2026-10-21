@@ -155,6 +155,10 @@ coldsnake mirror --exclude '*.tmp' --exclude '.stfolder/*' --prune
 coldsnake mirror --prune-delete       # prune permanently instead of trashing
 coldsnake mirror --no-upload-journal  # do not resume partial uploads next run
 coldsnake mirror --no-sync-db         # always compare against the remote listing
+coldsnake scrub                       # re-verify the next 1500 recorded folders
+coldsnake scrub --folders 3000        # longer slice of the same rotation
+coldsnake scrub --remote Sync         # one mirror only
+coldsnake scrub --all                 # every folder in one go (hours)
 coldsnake download --remote Sync --local /tmp/restore          # whole tree
 coldsnake download --remote Sync --file docs/report.pdf --local /tmp/restore
 coldsnake download --remote Sync --file docs/report.pdf --version 1 --local /tmp/old
@@ -220,6 +224,14 @@ probe.
 * **Verifies.** After uploading, each folder written to is re-listed and file sizes
   are compared. A download is sized against the listing and resumed from its
   partial `.tmp` on retry. Mismatches are reported as failures, not swallowed.
+* **Re-verifies later.** Uploads are only checked once, at upload time, so a file
+  lost or truncated on Icedrive's side afterwards would otherwise stay invisible -
+  the mirror trusts the sync db and reports "unchanged" forever. `coldsnake scrub`
+  re-lists folders whose recorded files have gone longest unchecked, compares
+  sizes, and forgets anything missing or resized so the next mirror run uploads it
+  again. Oldest-first rotation, not sampling: every folder is verified once per
+  cycle. `sync-db.sqlite` keeps the per-folder last-checked time, so runs resume
+  where the last one stopped.
 * **Retries.** Transport errors (5xx/429/522, timeouts) retry with backoff; an
   auth error triggers one fresh login; API-reported outages retry slowly (30 s ×
   attempt) rather than hammering.
@@ -241,6 +253,7 @@ purpose. Small-file rates are bound by round trips, so connections are kept aliv
 | 107.6 MB single file (13 chunks) | 69 s → 1.56 MB/s |
 | 26 MB / 4 chunks, 134 MB / 16 chunks | correct sizes, no chunk overhead |
 | several hundred GB across several trees | ~25 h first pass, dominated by the largest tree |
+| the raw directory count folders | ~80 min for a full scrub pass, one listing each at 1.5 calls/s |
 
 The first pass is long but **incremental and resumable**: a killed or failed run
 continues where it left off, so nightly runs simply chip away at it. Steady-state
@@ -252,10 +265,16 @@ nightly runs are minutes.
 per-user systemd setup, and `coldsnake@.service` + `coldsnake@.timer` templates for
 running as another (dedicated) user system-wide.
 
+It also ships `coldsnake-scrub.service` + `coldsnake-scrub.timer` (nightly 03:00),
+which drive the re-verification pass. Enable it too if you want uploads checked
+again later; it is deliberately scheduled away from the mirror because the API
+throttle is shared.
+
 ```bash
 mkdir -p ~/.config/systemd/user
-cp systemd/coldsnake.service systemd/coldsnake.timer ~/.config/systemd/user/
-systemctl --user enable --now coldsnake.timer
+cp systemd/coldsnake.service systemd/coldsnake.timer \
+   systemd/coldsnake-scrub.service systemd/coldsnake-scrub.timer ~/.config/systemd/user/
+systemctl --user enable --now coldsnake.timer coldsnake-scrub.timer
 ```
 
 A run is a `Type=oneshot` job, so `systemctl --user start coldsnake` (and
@@ -364,6 +383,13 @@ Details that matter:
   `X-Icedrive-Device-Id`; ColdSnake sends both. The User-Agent matters: a desktop
   string is refused with `HTTP 403 code 5001` ("Official Icedrive mobile client
   required"), so the mobile one is required, not cosmetic.
+* **Throttle knee (measured 2026-10-22, `tools/throttle_probe.py`)** - listing calls
+  are limited by rate, and going over costs a stall, not a retry: 1.39 calls/s held
+  for 10 min and 2.08 calls/s for 3 min with no 429 and flat ~0.42 s latency; 4.1
+  and 6.7 calls/s both answered `429` with `Retry-After: 90`, recovering only after
+  ~91 s. `Client` therefore paces `listing` at 1.5 calls/s by default
+  (`CONTROL_MIN_INTERVAL`) and slows down further for the rest of the run if a 429
+  still happens. Uploads are unaffected - only `/collection` is paced.
 * **No whole-tree listing** - the app's `collection-tree-full` is dead on this API
   (`code 2003` for every shape tried: routes, params, bodies, app identities and
   headers), and `/collection` accepts only `cloud`, `trash` and `shared`. Listing is

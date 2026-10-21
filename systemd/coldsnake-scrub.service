@@ -1,0 +1,14 @@
+[Unit]
+Description=ColdSnake - re-verify recorded uploads against Icedrive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/coldsnake/venv/bin/coldsnake scrub
+Nice=10
+IOSchedulingClass=idle
+# One listing call per folder at the measured safe rate (~1.5/s), so a default run
+# is ~15-20 min. Each run continues the rotation where the last one stopped, so a
+# timeout here never loses coverage, it only shortens that night's slice.
+TimeoutStartSec=infinity
