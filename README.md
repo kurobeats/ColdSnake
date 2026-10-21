@@ -479,6 +479,14 @@ folder per call and never batches listings.
   re-lists the destination and fails a file that is not there afterwards rather than
   claiming a move that did not happen; `Client.move_files` alone can only report how
   many ids the server accepted.
+* **Hidden folders are invisible.** `/collection` never returns dot-prefixed
+  folder names (verified 2026-10-22: a local `Pictures/.sync` and
+  `Pictures/Photos/.dtrash` exist, are absent from every listing, and a hidden
+  *file* in a visible folder - `sync_folder/.stignore` - is listed normally). So
+  `coldsnake scrub` reports files under hidden folders as `unverifiable` instead
+  of lost, and a hidden folder whose files later change cannot be resolved again,
+  which fails that file loudly rather than silently. Exclude such trees (`.sync/`,
+  `.dtrash/`) if you do not want them mirrored at all.
 * **Folders cannot be deleted** through this API: `/erase` reports success and the
   folder stays. Files can be permanently erased (`--prune-delete`, batch verified
   live) or moved to the trash and brought back with `coldsnake restore --id`

@@ -31,11 +31,13 @@ class ScrubStats:
     ok: int = 0
     requeued: int = 0
     missing_folders: int = 0
+    unverifiable: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {"folders": self.folders, "files": self.files, "ok": self.ok,
                 "requeued": self.requeued, "missing_folders": self.missing_folders,
+                "unverifiable": self.unverifiable,
                 "failures": [{"path": path, "error": error} for path, error in self.failures]}
 
 
@@ -79,6 +81,17 @@ def scrub_mirror(client, db, remote: str, limit: int | None, log=print) -> Scrub
     checked = db.checked_at(remote) if db else {}
     # Oldest first (never-checked folders sort first): a complete cycle, in order,
     # spread over as many runs as it takes. No randomness, so coverage is provable.
+    # A folder inside a hidden folder cannot be reached at all: /collection never
+    # returns dot-prefixed folders, so `.sync` or `.dtrash` look gone even when
+    # they exist. Nothing can be uploaded there either, so counting these as
+    # drift would only produce a failed re-upload on every run.
+    hidden = [d for d in by_dir if any(part.startswith(".") for part in d.split("/"))]
+    for directory in hidden:
+        stats.unverifiable += len(by_dir.pop(directory))
+    if hidden:
+        log(f"[{remote}] scrub: {len(hidden)} folder(s) under hidden names, "
+            f"{stats.unverifiable} file(s) not verifiable (the API never lists them)")
+
     todo = sorted(by_dir, key=lambda directory: checked.get(directory, 0))
     if limit is not None:
         todo = todo[:limit]

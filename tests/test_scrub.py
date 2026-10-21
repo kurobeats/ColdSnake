@@ -132,6 +132,19 @@ class ScrubTests(unittest.TestCase):
         self.assertEqual(client.calls.count(1), 1)            # b never re-resolved
         self.assertEqual(client.calls, [0, 100, 1, 2])        # one call per folder, root aside
 
+    def test_files_under_a_hidden_folder_are_unverifiable_not_lost(self):
+        """The API never lists dot-prefixed folders, so .sync/.dtrash read as gone
+        even when they exist; requeueing them would just fail an upload each run."""
+        db = make_db([("Photos/.dtrash/files/a", 10), ("Photos/kept", 5)])
+        client = FakeClient({0: [folder_entry(100, "archive")],
+                             100: [folder_entry(1, "Photos")],
+                             1: [file_entry(11, "kept", 5)]})
+        stats = scrub_mirror(client, db, "archive", limit=None, log=self.log)
+
+        self.assertEqual((stats.unverifiable, stats.requeued, stats.ok), (1, 0, 1))
+        self.assertIsNotNone(db.get("archive", "Photos/.dtrash/files/a"))
+        self.assertEqual(stats.folders, 1)                  # the hidden folder was skipped
+
     def test_nothing_recorded_is_a_no_op(self):
         client = FakeClient({})
         stats = scrub_mirror(client, SyncDb(":memory:"), "archive", limit=None, log=self.log)
