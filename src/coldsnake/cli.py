@@ -107,12 +107,13 @@ def discord_payload(payload: dict) -> dict:
     for key in ("failures", "uploaded", "unchanged", "verified", "duration_s"):
         if key in payload:
             fields.append({"name": key, "value": str(payload[key])[:1024], "inline": True})
-    return {"embeds": [{
-        "title": f"ColdSnake {payload.get('event', '?')}: "
-                 f"{payload.get("command", "?")} {'ok' if ok else 'FAILED'}",
+    command = payload.get("command", "?")            # precomputed: 3.11 has no
+    return {"embeds": [{                              # quote reuse inside f-strings
+        "title": f"ColdSnake {payload.get('event', '?')}: {command} "
+                 f"{'ok' if ok else 'FAILED'}",
         "color": 0x2ecc71 if ok else 0xe74c3c,
-        "description": f"{payload.get("command", "?")} run "
-                       f"{payload.get("started", "?")} → {payload.get("finished", "?")}",
+        "description": f"{command} run "
+                       f"{payload.get('started', '?')} → {payload.get('finished', '?')}",
         "fields": fields[:25],
     }]}
 
