@@ -205,7 +205,7 @@ probe.
 
 * **Incremental.** Uploads only when size or mtime differ (mtime tolerance 2 s).
   Icedrive preserves the upload-time mtime, so a second run is nearly free: a
-  a few-thousand-file tree re-checks in ~56 s and uploads nothing.
+  a few thousand-file tree re-checks in under a minute and uploads nothing.
 * **Additive.** No remote item is removed unless `--prune` is passed - and then it
   is trashed (recoverable) unless `--prune-delete` is set. A file removed locally
   stays remote by default.
@@ -249,10 +249,10 @@ purpose. Small-file rates are bound by round trips, so connections are kept aliv
 
 | workload | measured |
 |---|---|
-| a few thousand files / a few hundred MB | ~10 min uploading, then 56 s for a no-op re-check |
+| 2 500 files / ~300 MB | ~10 min uploading, then under a minute for a no-op re-check |
 | 107.6 MB single file (13 chunks) | 69 s → 1.56 MB/s |
 | 26 MB / 4 chunks, 134 MB / 16 chunks | correct sizes, no chunk overhead |
-| several hundred GB across several trees | ~25 h first pass, dominated by the largest tree |
+| a few hundred GB across several trees | tens of hours for a first pass, dominated by the largest tree |
 | several thousand folders | ~60 min for a full scrub pass, one listing each at 1.5 calls/s |
 
 The first pass is long but **incremental and resumable**: a killed or failed run
