@@ -372,7 +372,8 @@ def main(argv: list[str] | None = None) -> int:
     scrub = sub.add_parser("scrub", parents=[common],
                            help="re-verify recorded uploads against the remote, oldest folder first")
     scrub.add_argument("--folders", type=int, default=1500, metavar="N",
-                       help="folders to verify this run (default 1500, ~17 min at the measured safe rate)")
+                       help="folders to verify per mirror this run (default 1500; six mirrors is about an hour "
+                            "at the measured safe rate)")
     scrub.add_argument("--remote", help="only this mirror's remote folder name")
     scrub.add_argument("--all", action="store_true", help="verify every folder (hours, 429-paced)")
     scrub.add_argument("--json", action="store_true", help="emit one JSON summary on stdout")

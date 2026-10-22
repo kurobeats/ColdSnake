@@ -155,8 +155,8 @@ coldsnake mirror --exclude '*.tmp' --exclude '.stfolder/*' --prune
 coldsnake mirror --prune-delete       # prune permanently instead of trashing
 coldsnake mirror --no-upload-journal  # do not resume partial uploads next run
 coldsnake mirror --no-sync-db         # always compare against the remote listing
-coldsnake scrub                       # re-verify the next 1500 recorded folders
-coldsnake scrub --folders 3000        # longer slice of the same rotation
+coldsnake scrub                       # re-verify the next 1500 folders per mirror
+coldsnake scrub --folders 3000        # longer slice of the same rotation, per mirror
 coldsnake scrub --remote Sync         # one mirror only
 coldsnake scrub --all                 # every folder in one go (hours)
 coldsnake download --remote Sync --local /tmp/restore          # whole tree
@@ -253,7 +253,7 @@ purpose. Small-file rates are bound by round trips, so connections are kept aliv
 | 107.6 MB single file (13 chunks) | 69 s → 1.56 MB/s |
 | 26 MB / 4 chunks, 134 MB / 16 chunks | correct sizes, no chunk overhead |
 | several hundred GB across several trees | ~25 h first pass, dominated by the largest tree |
-| the raw directory count folders | ~80 min for a full scrub pass, one listing each at 1.5 calls/s |
+| several thousand folders | ~60 min for a full scrub pass, one listing each at 1.5 calls/s |
 
 The first pass is long but **incremental and resumable**: a killed or failed run
 continues where it left off, so nightly runs simply chip away at it. Steady-state
