@@ -40,8 +40,8 @@ class TrashTests(unittest.TestCase):
     def test_trash_request_shape(self):
         client = Recorder()
         client.trash(123)
-        self.assertEqual(client.calls, [{"path": "/api", "method": "POST",
-                                         "form": {"request": ["trash-add"], "items": ["file-123"]}}])
+        self.assertEqual(client.calls, [{"path": "/trash-add", "method": "POST",
+                                         "form": {"items": ["file-123"]}}])
 
     def test_trash_folder_prefix(self):
         client = Recorder()
@@ -51,14 +51,15 @@ class TrashTests(unittest.TestCase):
     def test_restore_request_shape(self):
         client = Recorder()
         client.restore(123)
-        self.assertEqual(client.calls, [{"path": "/api", "method": "POST",
-                                         "form": {"request": ["trash-restore"], "items": ["file-123"]}}])
+        self.assertEqual(client.calls, [{"path": "/restore-trash?itemId=123&type=file",
+                                         "method": "POST",
+                                         "form": {"itemId": ["123"], "type": ["file"]}}])
 
     def test_restore_folder_prefix(self):
         client = Recorder()
         client.restore(9, is_folder=True)
-        self.assertEqual(client.calls[0]["form"]["request"], ["trash-restore"])
-        self.assertEqual(client.calls[0]["form"]["items"], ["folder-9"])
+        self.assertEqual(client.calls[0]["path"], "/restore-trash?itemId=9&type=folder")
+        self.assertEqual(client.calls[0]["form"]["type"], ["folder"])
 
     def test_trash_listing_unwraps_data(self):
         response = {"/collection?type=trash&folderId=0": {"data": [{"id": 1, "filename": "x"}]}}

@@ -1,11 +1,11 @@
-"""Icedrive v3 mobile API client: proof-of-work login, folders, streaming upload.
+"""Icedrive v3 desktop API client: proof-of-work login, folders, streaming upload.
 
 Protocol (recovered from Icedrive's own clients):
-  POST /api  {app:ios, request:pow-new, scope:login}     -> PoW challenge
-  POST /api  {password, email, pow_proof, request:login} -> bearer token
-  GET  /collection?type=cloud&folderId=<id>              -> folder listing
-  POST /folder-create (multipart)                        -> create a folder
-  GET  /geo-fileserver-list?app=ios&pow_proof=<b64>      -> signed /deposit endpoints
+  POST /pow-new (multipart app=desktop, scope=login)      -> PoW challenge
+  POST /login   (multipart app,email,password,pow_proof)  -> bearer token
+  GET  /collection?type=cloud&folderId=<id>               -> folder listing
+  POST /folder-create (multipart)                         -> create a folder
+  GET  /geo-fileserver-list?app=ios&pow_proof=<b64>       -> signed /deposit endpoints
   POST <deposit endpoint> multipart {folderId, moddate, files[]} -> store the file
 
 PoW: sha256(challenge_bytes || nonce12 || counter_be32) must have at least
@@ -32,12 +32,16 @@ import urllib.parse
 import urllib.request
 import uuid
 
-API = "https://apis.icedrive.net/v3/mobile"
-USER_AGENT = "icedrive-ios/2.3.1"
-# ponytail: tried matching the CLI UA (icedrive-linux-cli/3.62) per
-# ICEDRIVECLI_V3.62 static docs; the live server answers 403 Forbidden for any
-# linux-cli UA on apis.icedrive.net/v3/mobile (verified 2026-09-30). The CLI
-# evidently uses another host. Retry the swap only after finding that host.
+# The /v3/desktop API is the one Icedrive's own desktop and CLI clients use. The
+# /v3/mobile API that 0.1.10 spoke was retired: every request there answers
+# {"code": 3000, "message": "Please update app to latest version"} - pow-new,
+# user-stats, even a cached bearer - for any iOS User-Agent version (2.3.1
+# through 99.0, checked 2026-10-26), and a non-mobile User-Agent is refused with
+# code 5001. The desktop client's own identity is what the server still accepts.
+API = "https://apis.icedrive.net/v3/desktop"
+USER_AGENT = "icedrive-linux-cli/3.62"
+# The desktop API requires this header on every request (captured from
+# IcedriveCLI-v3.62 on 2026-10-26); without it the server answers 2003.
 # Socket timeouts are inactivity timeouts: as long as bytes flow, a large upload
 # is fine. They are deliberately short so a stalled server surfaces as a retryable
 # failure instead of hanging the run.
@@ -103,6 +107,23 @@ def upload_id_for(folder_id: int, path: str, size: int, mtime: int) -> str:
 
 
 _SERVER_STRIPPED = '<>:"/\\|?'
+
+
+def _storage_stats(raw):
+    """Normalize a stats payload to the nested {"storage": {...}} shape.
+
+    The desktop /stats-storage document is flat and carries no bandwidth figures;
+    the retired mobile /user-stats nested the same numbers under "storage". A
+    payload that is already nested, or is not stats at all, passes through.
+    """
+    if not isinstance(raw, dict) or "storage" in raw:
+        return raw
+    keys = ("used", "used_human", "max", "max_human", "free", "free_human",
+            "pcent", "pcent_raw")
+    if any(key in raw for key in keys):
+        return {"storage": {key: raw.get(key) for key in keys}}
+    return raw
+
 
 def name_key(name: str) -> str:
     """How the server compares item names. Seen live (test-account 2026-10-13):
@@ -206,7 +227,7 @@ class Client:
         self.upload_timeout = upload_timeout
         self.retries = retries
         # The official clients identify themselves with a stable device id and an
-        # X-App-Method header; matching that seems prudent when the API throttles.
+        # API-version header; the desktop API requires both.
         self.device_id = device_id
         self.chunk_size = chunk_size
         self.log = log
@@ -221,17 +242,19 @@ class Client:
         self._connections: dict[str, http.client.HTTPSConnection] = {}
 
     # --- transport -------------------------------------------------------
-    def _identity(self) -> dict:
-        headers = {"User-Agent": USER_AGENT, "Accept": "*/*", "X-App-Method": "sync"}
-        if self.device_id:
-            headers["X-Icedrive-Device-Id"] = self.device_id
+    def _identity(self, device: str | None = None) -> dict:
+        headers = {"User-Agent": USER_AGENT, "Accept": "*/*", "X-Icedrive-Api-Version": "2"}
+        device = device or self.device_id
+        if device:
+            headers["X-Icedrive-Device-Id"] = device
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
         return headers
 
-    def _request(self, url, body=None, content_type=None, method="GET", auth=True):
+    def _request(self, url, body=None, content_type=None, method="GET", auth=True,
+                 device: str | None = None):
         request = urllib.request.Request(url, data=body, method=method)
-        for key, value in self._identity().items():
+        for key, value in self._identity(device).items():
             if key == "Authorization" and not auth:
                 continue
             request.add_header(key, value)
@@ -296,17 +319,25 @@ class Client:
     _token_path: str | None = None
 
     def login(self) -> dict:
-        body, content_type = _urlencode({"app": "ios", "request": "pow-new", "scope": "login"})
+        # Desktop-API login, captured from IcedriveCLI-v3.62 on 2026-10-26: POST
+        # /pow-new (multipart app=desktop, scope=login), then POST /login
+        # (multipart app/email/password/pow_proof). The login call sends its
+        # device id with a "::m" suffix; pow-new sends it plain. The PoW answer
+        # keeps the same shape as before, so solve_pow is unchanged.
+        body, content_type = _multipart({"app": "desktop", "scope": "login"})
         challenge = self._retry(
-            lambda: self._request(API + "/api", body, content_type, "POST", auth=False), auth=False)
+            lambda: self._request(API + "/pow-new", body, content_type, "POST", auth=False),
+            auth=False)
         proof = base64.b64encode(json.dumps(solve_pow(challenge)).encode()).decode()
-        body, content_type = _urlencode({
-            "password": self.password, "pow_proof": proof, "request": "login",
-            "email": self.email, "no_token_check": "true", "app": "ios",
+        device = self.device_id + "::m" if self.device_id else None
+        body, content_type = _multipart({
+            "app": "desktop", "email": self.email,
+            "password": self.password, "pow_proof": proof,
         })
         try:
             result = self._retry(
-                lambda: self._request(API + "/api", body, content_type, "POST", auth=False), auth=False)
+                lambda: self._request(API + "/login", body, content_type, "POST",
+                                      auth=False, device=device), auth=False)
         except IcedriveError as exc:
             # Live-verified 2026-09-30: an account with 2FA answers the login
             # POST with {"code": 6000, "message": "Two Factor Authentication
@@ -335,15 +366,15 @@ class Client:
     def _confirm_twofa(self, challenge: dict) -> dict:
         """Second login step for accounts with 2FA enabled.
 
-        Live-verified on test-account 2026-09-30: the login POST answers
-        {"code": 6000, "message": "Two Factor Authentication Required",
-        "userId": <id>, "method": "gauth"}; the confirm request is POST /api
-        {request: 2fa-gauth-verify (gauth, from the CLI client) or
-        2fa-sms-confirm-code, app, userId, gauth|sms: code, code: code}.
-        gauthconfirm/smsconfirm are CLI-foreign names (2003 Invalid request) and
-        without userId the 2fa-* requests answer 2001 Missing data. The one
-        unverified detail is whether a successful confirm returns a token
-        directly - collapse this if the server hands something different.
+        Live-verified on test-account 2026-09-30 (mobile API): the login POST
+        answers {"code": 6000, "message": "Two Factor Authentication Required",
+        "userId": <id>, "method": "gauth"}; the confirm request names
+        2fa-gauth-verify (gauth) or 2fa-sms-confirm-code and needs userId plus the
+        code. On the desktop API those names are their own routes rather than
+        request= values on /api (route strings in IcedriveCLI-v3.62, 2026-10-26),
+        so the confirm posts to /<request>; no 2FA account was available to
+        verify the route, and a successful confirm's payload is still unknown -
+        collapse this if the server hands something different.
         """
         code = os.environ.get("ICEDRIVE_2FA_CODE")
         if not code and sys.stdin.isatty():
@@ -352,13 +383,14 @@ class Client:
             raise AuthError("2FA required: set ICEDRIVE_2FA_CODE or run interactively")
         field = "sms" if challenge.get("method") == "sms" else "gauth"
         request = "2fa-sms-confirm-code" if field == "sms" else "2fa-gauth-verify"
-        body, content_type = _urlencode({"app": "ios", "request": request,
+        device = self.device_id + "::m" if self.device_id else None
+        body, content_type = _urlencode({"app": "desktop",
                                          "userId": str(challenge.get("userId", "")),
                                          field: code, "code": code})
         try:
             result = self._retry(
-                lambda: self._request(API + "/api", body, content_type, "POST", auth=False),
-                auth=False)
+                lambda: self._request(API + "/" + request, body, content_type, "POST",
+                                      auth=False, device=device), auth=False)
         except (IcedriveError, urllib.error.HTTPError) as exc:
             raise AuthError(f"2FA confirm failed: {exc}") from exc
         if isinstance(result, dict) and result.get("token"):
@@ -370,7 +402,7 @@ class Client:
         unavailable, AuthError if the account is not usable, returns stats if fine.
         Deliberately does not retry - the caller decides how long to wait."""
         try:
-            result = self._request(API + "/user-stats")
+            result = self._request(API + "/stats-storage")
         except urllib.error.HTTPError as exc:
             if exc.code in RETRY_STATUS:
                 raise TransientError(f"HTTP {exc.code} {exc.reason}") from exc
@@ -379,11 +411,17 @@ class Client:
             raise IcedriveError(f"HTTP {exc.code} {exc.reason}") from exc
         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
             raise TransientError(str(exc)) from exc
-        return check_payload(result)
+        return _storage_stats(check_payload(result))
 
     def user_stats(self) -> dict:
-        """Storage/bandwidth usage: {storage: {used, max, free, pcent}, bandwidth: {...}}."""
-        return self.call("/user-stats")
+        """Storage usage: {storage: {used, max, free, pcent, ...}}.
+
+        The desktop API's /stats-storage answers a flat document (verified live
+        2026-10-26: used/used_human/max/max_human/free/free_human/pcent/pcent_raw);
+        the retired mobile /user-stats nested it under "storage" and added
+        bandwidth. _storage_stats gives callers the one nested shape either way.
+        """
+        return _storage_stats(self.call("/stats-storage"))
 
     # --- token cache -----------------------------------------------------
     def save_token(self, path: str) -> None:
@@ -478,8 +516,8 @@ class Client:
     def upload_endpoints(self) -> list[str]:
         if self._endpoints and time.time() - self._endpoints_at < 240:
             return list(self._endpoints)
-        body, content_type = _urlencode({"app": "ios", "request": "pow-new", "scope": "geo-fileserver-list"})
-        challenge = self.call("/api", body, content_type, "POST")
+        body, content_type = _multipart({"app": "desktop", "scope": "geo-fileserver-list"})
+        challenge = self.call("/pow-new", body, content_type, "POST")
         proof = base64.b64encode(json.dumps(solve_pow(challenge)).encode()).decode()
         result = self.call(f"/geo-fileserver-list?app=ios&pow_proof={urllib.parse.quote(proof)}")
         endpoints = result.get("upload_endpoints") or []
@@ -786,26 +824,33 @@ class Client:
         return len(file_ids)
 
     # --- trash / versions -------------------------------------------------
-    # Wire formats verified live on 2026-09-24: POST /api {request: "trash-add"
-    # |"trash-restore", items: "file-<id>"} (the restore request name is
-    # `trash-restore`, NOT `restore-trash`), GET /collection?type=trash&
-    # folderId=0 for the trash listing, and GET /version-list?id=<id> whose
-    # per-version `url` is the only way to fetch an old version (a &version=
-    # param on /download is ignored).
+    # Route names captured from IcedriveCLI-v3.62 (2026-10-26): trash-add,
+    # restore-trash with an itemId query, erase, and GET
+    # /collection?type=trash&folderId=0 for the trash listing. GET
+    # /version-list?id=<id> is unchanged and its per-version `url` is the only way
+    # to fetch an old version.
 
     def trash(self, item_id: int, is_folder: bool = False) -> None:
-        """Move one item to the trash. Folder ids are passed through but
-        folder trash is untested; only file-<id> is verified."""
-        body, content_type = _urlencode({"request": "trash-add",
-                                         "items": f"{'folder' if is_folder else 'file'}-{item_id}"})
-        self.call("/api", body, content_type, "POST")
+        """Move one item to the trash. Folder ids are passed through; only
+        file-<id> is verified against the live account."""
+        body, content_type = _urlencode({
+            "items": f"{'folder' if is_folder else 'file'}-{item_id}"})
+        self.call("/trash-add", body, content_type, "POST")
 
     def restore(self, item_id: int, is_folder: bool = False) -> None:
-        """Restore one trashed item. Request name is `trash-restore` (verified),
-        item field is `items` with a file-/folder- prefix."""
-        body, content_type = _urlencode({"request": "trash-restore",
-                                         "items": f"{'folder' if is_folder else 'file'}-{item_id}"})
-        self.call("/api", body, content_type, "POST")
+        """Restore one trashed item.
+
+        UNVERIFIED on the desktop API: /restore-trash?itemId=<id>&type=file (the
+        route the app builds) answers 2003 Invalid request, as do the other
+        spellings tried against the live account on 2026-10-26, so only the
+        mobile API's `trash-restore` shape is known to have worked. Restoring
+        through the Icedrive app is the reliable path until this is resolved;
+        the call is left in place so a working shape can drop straight in.
+        """
+        item_type = "folder" if is_folder else "file"
+        body, content_type = _urlencode({"itemId": str(item_id), "type": item_type})
+        self.call(f"/restore-trash?itemId={int(item_id)}&type={item_type}",
+                  body, content_type, "POST")
 
     def trash_listing(self) -> list[dict]:
         """Trashed items: same entry shape as a folder listing."""
@@ -824,12 +869,11 @@ class Client:
         return versions
 
     # --- move / rename ----------------------------------------------------
-    # Wire formats verified live on 2026-09-24: POST /api {request: "move",
-    # items: "file-<id>[,file-<id>]", folderId: "<destination>"} - the app's
-    # `nitems` field is rejected there (2001 Missing data) and several ids are
-    # comma-joined on `items` - and POST /api {request: "file-rename",
-    # id: "<id>", filename: "<new name>"} where the request name is
-    # `file-rename` (`request=rename` is 2003) and the id field is `id`.
+    # Live-verified on the desktop API 2026-10-26: POST /move
+    # {request:move, items:file-<id>[,file-<id>], folderId:<dest>} answers
+    # {"error":false,"message":"Move successful"} (the app's nitems field is
+    # refused there - HTTP 400), and POST /file-rename {request:file-rename,
+    # id:<id>, filename:<new>} answers with the new name.
 
     def move_files(self, file_ids: list[int], folder_id: int) -> int:
         """Move several files into one folder in a single call; returns how many.
@@ -837,8 +881,8 @@ class Client:
         An empty list is a no-op and issues no call, and a TransientError
         propagates: an outage must surface as an outage, never as a partial move.
 
-        The API answers success even for an id that no longer exists (verified live),
-        so the returned count is "ids the server accepted", not proof of a move.
+        The API answers success even for an id that no longer exists, so the
+        returned count is "ids the server accepted", not proof of a move.
         """
         file_ids = list(dict.fromkeys(file_ids))     # a repeated id is one file
         if not file_ids:
@@ -846,7 +890,7 @@ class Client:
         items = ",".join(f"file-{file_id}" for file_id in file_ids)
         body, content_type = _urlencode({"request": "move", "items": items,
                                          "folderId": str(folder_id)})
-        self.call("/api", body, content_type, "POST")
+        self.call("/move", body, content_type, "POST")
         return len(file_ids)
 
     def rename_file(self, file_id: int, filename: str) -> str:
@@ -860,7 +904,7 @@ class Client:
             raise IcedriveError(f"refusing to rename file {file_id} to an empty name")
         body, content_type = _urlencode({"request": "file-rename", "id": str(file_id),
                                          "filename": filename})
-        result = self.call("/api", body, content_type, "POST")
+        result = self.call("/file-rename", body, content_type, "POST")
         if isinstance(result, dict) and result.get("filename"):
             return result["filename"]
         return filename

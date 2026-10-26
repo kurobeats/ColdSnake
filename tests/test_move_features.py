@@ -37,7 +37,7 @@ class MoveTests(unittest.TestCase):
     def test_one_id_request_shape(self):
         client = Recorder()
         self.assertEqual(client.move_files([123], 42), 1)
-        self.assertEqual(client.calls, [{"path": "/api", "method": "POST",
+        self.assertEqual(client.calls, [{"path": "/move", "method": "POST",
                                          "form": {"request": ["move"], "items": ["file-123"],
                                                   "folderId": ["42"]}}])
 
@@ -59,13 +59,13 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(client.calls, [], "an empty move must issue no call")
 
     def test_transient_error_is_not_swallowed(self):
-        client = Recorder({"/api": TransientError("service down")})
+        client = Recorder({"/move": TransientError("service down")})
         with self.assertRaises(TransientError):
             client.move_files([1, 2], 42)
         self.assertEqual(len(client.calls), 1, "the failure must surface, not be retried away")
 
     def test_auth_error_propagates_unchanged(self):
-        client = Recorder({"/api": AuthError("bad token")})
+        client = Recorder({"/move": AuthError("bad token")})
         with self.assertRaises(AuthError):
             client.move_files([1], 42)
 
@@ -74,14 +74,14 @@ class RenameTests(unittest.TestCase):
     def test_rename_request_shape(self):
         client = Recorder()
         client.rename_file(123, "new.txt")
-        self.assertEqual(client.calls, [{"path": "/api", "method": "POST",
+        self.assertEqual(client.calls, [{"path": "/file-rename", "method": "POST",
                                          "form": {"request": ["file-rename"], "id": ["123"],
                                                   "filename": ["new.txt"]}}])
         self.assertEqual(client.bodies, ["request=file-rename&id=123&filename=new.txt"])
 
     def test_returned_name_comes_from_the_response(self):
-        response = {"/api": {"error": False, "message": "File Renamed",
-                             "filename": "server.txt", "id": 123}}
+        response = {"/file-rename": {"error": False, "message": "File Renamed",
+                                      "filename": "server.txt", "id": 123}}
         client = Recorder(response)
         self.assertEqual(client.rename_file(123, "asked.txt"), "server.txt")
 
@@ -96,7 +96,7 @@ class RenameTests(unittest.TestCase):
         self.assertEqual(client.calls, [], "a bad name must never reach the API")
 
     def test_transient_error_is_not_swallowed(self):
-        client = Recorder({"/api": TransientError("service down")})
+        client = Recorder({"/file-rename": TransientError("service down")})
         with self.assertRaises(TransientError):
             client.rename_file(123, "new.txt")
         self.assertEqual(len(client.calls), 1)

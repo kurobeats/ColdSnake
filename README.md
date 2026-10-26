@@ -3,15 +3,16 @@
 A python icedrive client.
 
 Upload-only mirroring, folder listing and proof-of-work login for Icedrive, driven
-directly against the v3 mobile API that Icedrive's own apps use - plus download and
-restore, a recoverable trash, version history, and batched deletes. No WebDAV, no GUI,
-no third-party binaries, no dependencies beyond the standard library.
+directly against the v3 desktop API that Icedrive's own desktop and CLI clients
+use - plus download and restore, a recoverable trash, version history, and batched
+deletes. No WebDAV, no GUI, no third-party binaries, no dependencies beyond the
+standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of a few hundred GB.
 Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs, trash/restore, version history, batch delete,
+verification, idempotent re-runs, trash, version history, batch delete,
 move/rename, download resume).
-156 unit tests.
+180 unit tests.
 
 ## Why this exists
 
@@ -163,7 +164,7 @@ coldsnake download --remote Sync --local /tmp/restore          # whole tree
 coldsnake download --remote Sync --file docs/report.pdf --local /tmp/restore
 coldsnake download --remote Sync --file docs/report.pdf --version 1 --local /tmp/old
 coldsnake trash                       # list the remote trash (id, name, size, date)
-coldsnake restore --id 12345          # bring a trashed item back (--id repeatable)
+coldsnake restore --id 12345          # bring a trashed item back (--id repeatable; currently fails on the desktop API - use the app, see Limitations)
 coldsnake versions --remote Sync --file docs/report.pdf
 coldsnake mv --remote Sync --file docs/report.pdf --to archive          # into an existing folder
 coldsnake rename --remote Sync --file docs/report.pdf --name report-final.pdf
@@ -337,17 +338,18 @@ and systemd will not start a second copy while one is running.
 
 ## Protocol notes
 
-Recovered from Icedrive's own clients; the mobile API lives at
-`https://apis.icedrive.net/v3/mobile` with `User-Agent: icedrive-ios/2.3.1`.
+Recovered from Icedrive's own clients; the desktop API lives at
+`https://apis.icedrive.net/v3/desktop` with `User-Agent: icedrive-linux-cli/3.62`
+and `X-Icedrive-Api-Version: 2` on every request.
 
 ```
-POST /api  {app:ios, request:pow-new, scope:login}      -> proof-of-work challenge
-POST /api  {password, email, pow_proof, request:login}  -> bearer token
-GET  /user-stats                                        -> storage + bandwidth usage
+POST /pow-new  multipart {app:desktop, scope:login}     -> proof-of-work challenge
+POST /login    multipart {app,email,password,pow_proof}  -> bearer token
+GET  /stats-storage                                     -> storage usage
 GET  /collection?type=cloud&folderId=<id>               -> folder listing
 GET  /collection?type=trash&folderId=0                  -> trash listing
-POST /api  {request:trash-add, items:file-<id>}         -> move an item to the trash
-POST /api  {request:trash-restore, items:file-<id>}     -> restore it to its folder
+POST /trash-add   {items:file-<id>}                     -> move an item to the trash
+POST /restore-trash?itemId=<id>&type=file               -> restore it (UNVERIFIED)
 POST /folder-create (multipart)                         -> create a folder
 GET  /geo-fileserver-list?app=ios&pow_proof=<b64>       -> signed /deposit endpoints
 POST <deposit endpoint> multipart {folderId, moddate, files[]}          -> whole file
@@ -356,9 +358,13 @@ POST <deposit endpoint> multipart {folderId, moddate, unique_upload_id,
 GET  /download?id=<id>                                  -> signed node url for the file
 GET  /version-list?id=<id>                              -> revision list, each with its own url
 POST /erase  {items:file-<id>[,file-<id>…]}             -> delete one file or a batch
-POST /api  {request:move, items:file-<id>[,file-<id>], folderId:<dest>} -> move files into a folder
-POST /api  {request:file-rename, id:<id>, filename:<new>}               -> rename one file
+POST /move   {request:move, items:file-<id>[,file-<id>], folderId:<dest>} -> move files into a folder
+POST /file-rename  {request:file-rename, id:<id>, filename:<new>}         -> rename one file
 ```
+
+All of the above except `/restore-trash` were verified against the live account on
+2026-10-26 (login, listing, upload whole + chunked with a matching sha256 round
+trip, versions, download, move, rename, trash, erase, scrub).
 
 Details that matter:
 
@@ -379,10 +385,11 @@ Details that matter:
   handling upload parts`. The node that accepts a file's first chunk is therefore
   remembered and used for the rest of that file, and a file that still cannot be
   assembled drops its journal entry so the next run re-sends it whole to one node.
-* **Client identity** - Icedrive's own clients send `X-App-Method: sync` and a stored
-  `X-Icedrive-Device-Id`; ColdSnake sends both. The User-Agent matters: a desktop
-  string is refused with `HTTP 403 code 5001` ("Official Icedrive mobile client
-  required"), so the mobile one is required, not cosmetic.
+* **Client identity** - Icedrive's own clients send a stable `X-Icedrive-Device-Id`
+  and `X-Icedrive-Api-Version: 2`; ColdSnake sends both. The User-Agent matters: it
+  must be the desktop CLI's `icedrive-linux-cli/3.62`, because the retired
+  `/v3/mobile` path is the only one that wants an iOS string and it now answers
+  `code 3000` to everything.
 * **Throttle knee (measured 2026-10-22, `tools/throttle_probe.py`)** - listing calls
   are limited by rate, and going over costs a stall, not a retry: 1.39 calls/s held
   for 10 min and 2.08 calls/s for 3 min with no 429 and flat ~0.42 s latency; 4.1
@@ -419,7 +426,7 @@ actually needs.
 | post-upload verification | yes - sizes, uploads and downloads (no hash exists to compare) |
 | download | yes - `coldsnake download`, `GET /download?id=` signed node url (verified live), resumable via `Range` |
 | version history download | yes - `coldsnake versions`, `download --version N` via the version's own url |
-| trash / restore | yes - `coldsnake trash`, `coldsnake restore --id` (verified live) |
+| trash / restore | yes - `coldsnake trash` (verified live); `coldsnake restore --id` (route unknown on the desktop API) |
 | batch delete | yes - one `POST /erase` with comma-joined ids (verified live) |
 | storage quota check | yes - pre-flight gate + `coldsnake account` |
 | retries, backoff, per-file isolation | yes |
@@ -449,10 +456,15 @@ folder per call and never batches listings.
 * **2FA is not implemented.** With 2FA enabled, `coldsnake login` cannot complete.
   The cached token means this only bites when the token is invalidated; otherwise
   use an account without 2FA for scheduled runs.
-* **The mobile User-Agent is load-bearing.** A desktop `User-Agent` gets
-  `HTTP 403` with `code 5001` ("Official Icedrive mobile client required"), so
-  `icedrive-ios/2.3.1` plus `X-App-Method: sync` is what the API demands. It must
-  not be "fixed" to a browser or desktop string.
+* **Restore is currently unverified.** `POST /restore-trash?itemId=<id>&type=file`
+  - the shape the Icedrive app builds - answers `2003 Invalid request` on the
+  desktop API, and so did every other spelling tried on 2026-10-26. Trashing,
+  listing the trash and erasing all work; bringing an item back through this API
+  does not, so use the Icedrive app for that until the route is found.
+* **The desktop User-Agent is load-bearing.** It must be
+  `icedrive-linux-cli/3.62` with `X-Icedrive-Api-Version: 2`. The retired
+  `/v3/mobile` path answered `code 3000` ("Please update app to latest version") to
+  every iOS User-Agent version tried, so do not move back to a mobile string.
 * **Download is resumed and size-checked, not hash-checked.** `coldsnake download`
   asks `GET /download?id=<id>`, which returns a signed
   `https://<node>.icedrive.io/download?p=...` URL (verified live 2026-09-24), and
@@ -541,7 +553,7 @@ folder per call and never batches listings.
 ## Development
 
 ```bash
-python -m unittest discover -s tests     # 156 tests, no dependencies
+python -m unittest discover -s tests     # 180 tests, no dependencies
 ```
 
 CI (`.github/workflows/tests.yml`) runs exactly that on every push and pull
@@ -584,7 +596,7 @@ file rather than encoded as a test.
 Protocol details were reconstructed from Icedrive's own desktop client (its
 embedded web UI and its strings) and cross-checked against
 [`StarHack/go-icedrive`](https://github.com/StarHack/go-icedrive), an independent Go
-client for the same mobile API. Neither is affiliated with this project.
+client for the same API family. Neither is affiliated with this project.
 
 ## License
 

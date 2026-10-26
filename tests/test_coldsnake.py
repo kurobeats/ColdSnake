@@ -106,37 +106,43 @@ class TwofaTests(unittest.TestCase):
     def client_with(self, responses, twofa):
         client = Client("e@example.com", "pw", twofa=twofa)
         requests = []
+        urls = []
 
-        def fake_request(url, body=None, content_type=None, method="GET", auth=True):
+        def fake_request(url, body=None, content_type=None, method="GET", auth=True,
+                         device=None):
             requests.append(urllib.parse.parse_qs(body.decode()))
+            urls.append(url)
             return check_payload(responses[min(len(requests), len(responses)) - 1])
 
         client._request = fake_request
-        return client, requests
+        return client, requests, urls
 
     def test_twofa_off_login_fails_as_before(self):
-        client, requests = self.client_with([self.CHALLENGE, self.NEEDS_2FA], twofa=False)
+        client, requests, urls = self.client_with([self.CHALLENGE, self.NEEDS_2FA],
+                                                  twofa=False)
         with self.assertRaises(IcedriveError):
             client.login()
         self.assertEqual(len(requests), 2)          # only pow-new + login
+        self.assertTrue(urls[0].endswith("/pow-new"))
+        self.assertTrue(urls[1].endswith("/login"))
 
     def test_twofa_on_confirms_and_returns_token(self):
-        client, requests = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
-                                             {"token": "tok2", "auth_data": {"id": 1}}],
-                                            twofa=True)
+        client, requests, urls = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
+                                                   {"token": "tok2", "auth_data": {"id": 1}}],
+                                                  twofa=True)
         with mock.patch.dict(os.environ, {"ICEDRIVE_2FA_CODE": "123456"}):
             result = client.login()
         self.assertEqual(result["token"], "tok2")
         self.assertEqual(client.token, "tok2")
-        confirm = requests[2]                       # single live-verified form
-        self.assertEqual(confirm["request"], ["2fa-gauth-verify"])
+        confirm = requests[2]                       # the confirm carries the code
+        self.assertTrue(urls[2].endswith("/2fa-gauth-verify"))
         self.assertEqual(confirm["userId"], ["742146"])
         self.assertEqual(confirm["gauth"], ["123456"])
 
     def test_twofa_on_all_rejects_is_auth_error(self):
-        client, requests = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
-                                             {"code": 2200, "error": 1, "message": "bad"}],
-                                            twofa=True)
+        client, requests, urls = self.client_with([self.CHALLENGE, self.NEEDS_2FA,
+                                                   {"code": 2200, "error": 1, "message": "bad"}],
+                                                  twofa=True)
         # check_payload's error-document stash would leak across clients/tests;
         # the login POST must present a fresh 6000 each time.
         import coldsnake.client as m

@@ -445,7 +445,8 @@ def main(argv: list[str] | None = None) -> int:
             log(f"account : {user.get('email')} ({user.get('plan')})")
             log(f"storage : {storage.get('used_human')} of {storage.get('max_human')} used, "
                 f"{storage.get('free_human')} free ({storage.get('pcent')}%)")
-            log(f"bandwidth: {bandwidth.get('used_human')} of {bandwidth.get('max_human')} used")
+            if bandwidth:                       # the desktop API reports no bandwidth
+                log(f"bandwidth: {bandwidth.get('used_human')} of {bandwidth.get('max_human')} used")
             return 0
 
         if args.command == "check":
