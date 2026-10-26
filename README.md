@@ -9,9 +9,10 @@ deletes. No WebDAV, no GUI, no third-party binaries, no dependencies beyond the
 standard library.
 
 Status: **pre-1.0, working and in daily use** for scheduled backups of a few hundred GB.
-Verified against a live Icedrive account (login, listing, chunked uploads,
-verification, idempotent re-runs, trash, version history, batch delete,
-move/rename, download resume).
+Verified against a live Icedrive account (login, listing, whole and chunked uploads,
+verification, idempotent re-runs, move, rename, trash, version history, batch delete,
+download, scrub - re-verified end to end against the desktop API on 2026-10-26;
+`restore` is the one command still unresolved, see Limitations).
 180 unit tests.
 
 ## Why this exists
@@ -210,10 +211,12 @@ probe.
 * **Additive.** No remote item is removed unless `--prune` is passed - and then it
   is trashed (recoverable) unless `--prune-delete` is set. A file removed locally
   stays remote by default.
-* **Deletes are revertible and batched.** `coldsnake trash` lists what a prune (or
-  your own `Client.trash`) put in the remote trash, `coldsnake restore --id <id>`
-  puts it back where it was, and `--prune-delete` erases a whole batch with one
-  `POST /erase` carrying comma-joined ids.
+* **Deletes are batched, and trashing works.** `coldsnake trash` lists what a prune
+  (or your own `Client.trash`) put in the remote trash, and `--prune-delete` erases
+  a whole batch with one `POST /erase` carrying comma-joined ids. `coldsnake
+  restore --id <id>` is wired to the desktop API's `/restore-trash` route, which
+  answers `2003 Invalid request` today - restore through the Icedrive app until
+  that route is solved (see Limitations).
 * **Version history is readable.** Icedrive keeps previous revisions of an
   overwritten file: `coldsnake versions --remote NAME --file RELPATH` lists them and
   `coldsnake download ... --version N` fetches one, byte-for-byte from that
@@ -341,6 +344,13 @@ and systemd will not start a second copy while one is running.
 Recovered from Icedrive's own clients; the desktop API lives at
 `https://apis.icedrive.net/v3/desktop` with `User-Agent: icedrive-linux-cli/3.62`
 and `X-Icedrive-Api-Version: 2` on every request.
+
+Icedrive runs two API generations side by side. The mobile one (`/v3/mobile`, an
+iOS User-Agent and `request=` values on `/api`) was retired on 2026-10-26: every
+call there - proof-of-work, listing, even a cached bearer token - now answers
+`{"code": 3000, "message": "Please update app to latest version"}` regardless of
+the version in the User-Agent, and a non-mobile User-Agent is refused with
+`code 5001`. ColdSnake 0.1.11 and later speak the desktop generation below.
 
 ```
 POST /pow-new  multipart {app:desktop, scope:login}     -> proof-of-work challenge
@@ -499,15 +509,17 @@ folder per call and never batches listings.
   of lost, and a hidden folder whose files later change cannot be resolved again,
   which fails that file loudly rather than silently. Exclude such trees (`.sync/`,
   `.dtrash/`) if you do not want them mirrored at all.
-* **Folders cannot be deleted** through this API: `/erase` reports success and the
-  folder stays. Files can be permanently erased (`--prune-delete`, batch verified
-  live) or moved to the trash and brought back with `coldsnake restore --id`
-  (verified live). Because no folder can be deleted, empty remote directories
-  linger, and the `folder-<id>` trash/restore prefixes are untested (a probe folder
-  could not be cleaned up).
-* **Quota numbers are unreliable.** On the account tested, `/user-stats` reports
-  0 bytes used after 290 MB of uploads, so the storage gate is a safety net rather
-  than a meter.
+* **Folders can be trashed but not erased.** `/erase` reports success on a folder
+  and the folder stays (verified 2026-10-22), while `POST /trash-add
+  {items:folder-<id>}` does move it to the trash (verified 2026-10-26). Files can
+  be permanently erased (`--prune-delete`, batch verified live). ColdSnake prunes
+  files only, so empty remote directories linger; trash them from the Icedrive app
+  if that matters.
+* **Quota numbers come from the plan, not from the run.** `GET /stats-storage`
+  reports `used`/`max`/`free`/`pcent` for the whole account, so the storage gate in
+  `coldsnake mirror` answers "does this run still fit" and nothing finer. Earlier
+  builds read `/user-stats`, which reported 0 bytes used after 290 MB of uploads;
+  that path is retired along with the mobile API.
 * **Cross-run resume** covers chunked uploads: `~/.config/coldsnake/upload-journal.json`
   records which chunk offsets landed, so a run killed mid-file re-sends only the
   missing chunks for the same upload id. `--no-upload-journal` disables it and the
@@ -536,7 +548,7 @@ folder per call and never batches listings.
    upload accepts `hashAlgorithm`, `hash`, `checksum`, `md5` and `sha256` and
    ignores every one of them - a deliberately wrong md5 still uploads - and no
    digest appears anywhere afterwards: listing entries carry 16 keys and no hash,
-   `/version-list`, `/user-stats` and the upload response expose none, and the
+   `/version-list`, `/stats-storage` and the upload response expose none, and the
    download `ETag` is nginx `mtime-size`, not content-derived. Integrity therefore
    stays length-based and no hash check will be added - there is nothing to compare
    against.
